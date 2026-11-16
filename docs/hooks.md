@@ -1,4 +1,4 @@
-# Boot and SSH hooks (0.1)
+# Boot and SSH hooks (0.1.0)
 
 Both hooks use the same policy as the rest of KER:
 

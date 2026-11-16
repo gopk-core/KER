@@ -7,7 +7,10 @@ if [ -x /usr/bin/python3 ]; then
   py=$(readlink -f /usr/bin/python3 2>/dev/null || echo /usr/bin/python3)
   if [ -x "$py" ]; then
     mkdir -p /usr/lib/ker
-    ln -f "$py" /usr/lib/ker/ker-python 2>/dev/null || cp -a "$py" /usr/lib/ker/ker-python
+    # Copy, never hard-link. A shared inode with python3 would make an
+    # inode allowlist authorize every python3 process.
+    rm -f /usr/lib/ker/ker-python
+    cp -a "$py" /usr/lib/ker/ker-python
     chmod 755 /usr/lib/ker/ker-python 2>/dev/null || true
   fi
 fi

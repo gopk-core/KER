@@ -28,7 +28,7 @@ from ker.compat import (
 )
 from ker.features import added_features, apply_replacements, pending_replacements, stamp_known
 from ker.migrations import REGISTRY, pending as pending_migrations
-from ker.paths import CONFIG_PATH, PRIVATE_DIR, SNAPSHOT_DIR, STATE_PATH, TRUST_DIR, UPGRADE_DIR, VAR
+from ker.paths import CONFIG_PATH, PREFIX, PRIVATE_DIR, SNAPSHOT_DIR, STATE_PATH, TRUST_DIR, UPGRADE_DIR, VAR
 from ker.state import ensure_dirs, save_state, state as load_state
 
 
@@ -303,15 +303,43 @@ def rollback() -> dict:
     return {'ok': True, 'snapshot': str(path)}
 
 
+def release_keyring_candidates() -> list[Path]:
+    """Public release keys, in the order ker upgrade consults them.
+
+    The private signing key is never one of these paths.
+    """
+    found: list[Path] = []
+    env = os.environ.get('KER_RELEASE_KEYRING')
+    if env:
+        found.append(Path(env))
+    found.append(TRUST_DIR / 'release.gpg')
+    if PREFIX:
+        found.append(PREFIX / 'usr' / 'lib' / 'ker' / 'release-keys' / 'release.gpg')
+    found.append(Path('/usr/lib/ker/release-keys/release.gpg'))
+    found.append(Path(__file__).resolve().parents[2] / 'packaging' / 'release.gpg')
+    # de-dupe while keeping order
+    out: list[Path] = []
+    seen: set[str] = set()
+    for cand in found:
+        key = str(cand)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(cand)
+    return out
+
+
 def verify_package_file(path: Path, trust_package: bool = False) -> list[str]:
-    """Optional detached signature: <file>.sig verified with trust/release.gpg."""
-    from ker.paths import TRUST_DIR
+    """Detached signature: <file>.sig verified with the public release key.
+
+    Unsigned files are rejected unless trust_package is set. A signature that
+    does not match the installed public key is always rejected. Builds made
+    without the offline private key are unsigned; that is not a successful verify.
+    """
     warnings: list[str] = []
     path = Path(path)
     sig = Path(str(path) + '.sig')
-    keyring = TRUST_DIR / 'release.gpg'
-    shipped = Path('/usr/lib/ker/release-keys/release.gpg')
-    key = keyring if keyring.exists() else (shipped if shipped.exists() else None)
+    key = next((cand for cand in release_keyring_candidates() if cand.is_file()), None)
     if sig.exists() and key is not None:
         r = subprocess.run(
             ['gpgv', '--keyring', str(key), str(sig), str(path)],

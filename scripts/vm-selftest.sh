@@ -1,6 +1,16 @@
 #!/bin/bash
-# Runs as PID 1 inside the KER qemu guest. Never run on the production host.
+# Runs as PID 1 inside the KER qemu guest. Never run on the production host:
+# this script mounts bpffs, can load LSM programs, and reboots the machine.
 set -uo pipefail
+if [ "$$" -ne 1 ]; then
+  echo "vm-selftest: refusing to run (pid $$ is not 1). It must not install packages or load BPF on the build host." >&2
+  exit 1
+fi
+if ! grep -qw 'init=/usr/lib/ker/vm-selftest.sh' /proc/cmdline 2>/dev/null \
+   && ! grep -qw 'ker.selftest=phase2' /proc/cmdline 2>/dev/null; then
+  echo "vm-selftest: refusing to run without the guest kernel command line." >&2
+  exit 1
+fi
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PYTHONPATH="/usr/lib/ker${PYTHONPATH:+:$PYTHONPATH}"
 export KER_IN_VM=1
@@ -342,9 +352,10 @@ SERVE_PID=$!
 sleep 0.5
 kill -0 "$SERVE_PID" 2>/dev/null || fail "master serve died"
 
+FP=$(python3 -c 'from ker.state import state; print(state()["gpg_fingerprint"])')
 export KER_PREFIX=/tmp/ker-child
 mkdir -p "$KER_PREFIX"
-if ! ker --language zh-CN addnet --master 127.0.0.1:4170 --token "$(cat /tmp/token)" --yes --name child-vm; then
+if ! ker --language zh-CN addnet --master 127.0.0.1:4170 --token "$(cat /tmp/token)" --yes --fingerprint "$FP" --name child-vm; then
   unset KER_PREFIX
   kill "$SERVE_PID" 2>/dev/null || true
   fail "addnet join failed"
@@ -363,21 +374,28 @@ ker --language zh-CN enforce --set enforce --yes || fail "enforce enable failed"
 if ! /usr/lib/ker/ker-probe; then
   fail "ker-probe denied while media present"
 fi
+# cat is not an allowlisted path. ker-probe is an exact helper path, so it
+# must keep working when other programs are denied.
 python3 - << 'PY' || fail "media_ok flip / probe failed"
-import subprocess, sys
+import shutil, subprocess, sys
 from ker.enforce import update_maps
 from ker.state import state
 st = state()
 perms = st.get("permissions") or []
+cat = shutil.which("cat") or "/bin/cat"
 update_maps(enforcement=True, media_ok=False, permissions=perms)
-r = subprocess.run(["/usr/lib/ker/ker-probe"])
-print("probe rc with media_ok=0:", r.returncode)
+r = subprocess.run([cat, "/etc/hostname"], stdout=subprocess.DEVNULL)
+print("cat rc with media_ok=0:", r.returncode)
 if r.returncode == 0:
-    sys.exit("probe unexpectedly allowed")
+    sys.exit("cat unexpectedly allowed")
+probe = subprocess.run(["/usr/lib/ker/ker-probe"])
+print("ker-probe rc with media_ok=0:", probe.returncode)
+if probe.returncode != 0:
+    sys.exit("allowlisted ker-probe was denied")
 update_maps(enforcement=True, media_ok=True, permissions=perms)
-r = subprocess.run(["/usr/lib/ker/ker-probe"])
+r = subprocess.run([cat, "/etc/hostname"], stdout=subprocess.DEVNULL)
 if r.returncode != 0:
-    sys.exit("probe denied after restore")
+    sys.exit("cat denied after restore")
 print("enforcement probe ok")
 PY
 ker --language zh-CN enforce --set test --yes || fail "enforce disable failed"

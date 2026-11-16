@@ -8,7 +8,7 @@ A Linux kernel-level authorization system. Signed keys live on removable media; 
 
 [简体中文](README.md)
 
-Current version: **0.1** (first public release). License: [GNU Affero General Public License v3.0](LICENSE).
+Current version: **0.1.0** (first public release; the already published `0.1` compares equal to `0.1.0` and upgrades in place). License: [GNU Affero General Public License v3.0](LICENSE).
 
 ## Safety notes (read these first)
 
@@ -39,7 +39,7 @@ The first run of `ker` starts a terminal wizard (English / Simplified Chinese / 
 
 - KER lists every recognizable block device (not only USB sticks). After confirmation it formats the device and writes a sealed file set.
 - Rewritable removable media uses FAT32, hard disks use ext4, DVD-R gets an ISO9660 image, and WORM media is written only when empty — it is never reformatted.
-- Each key is 10MB. `root.pem` is signed but not encrypted; other keys are encrypted and then signed. Unwrapping material comes from a fixed section of `root.pem`. Without the root key, no permission can be established.
+- Each key is 10MB. The signed object on the medium is `bundle.json`, a hash list of the key files. It carries a detached GPG signature (`bundle.json.sig`) and an OpenSSL RSA signature (`bundle.json.ksig`). Individual pem files are not signed on their own; their integrity is the hash in that list. `root.pem` is not encrypted. Every other key is encrypted with the fixed section of `root.pem` and then listed. This is not a per-pem signature. A holder of `root.pem` can unwrap the other keys; KER does not claim confidentiality against that holder. Without the root key, no permission can be established.
 - Unwrapped material is placed in the kernel keyring where possible, not written in cleartext under ordinary directories.
 - The default is a single medium. Keys can also be split across several disks, each signed on its own. The admin key `admin.pem` is required for `ker console`.
 - After writing media, KER enters test mode: it reports verification results in the terminal and does not enable kernel interception. An optional unplug/replug check is available.
@@ -51,23 +51,25 @@ Packages are architecture-specific (no longer `Architecture: all`) because they 
 Copy the package that matches the machine, then:
 
 ```bash
-sudo dpkg -i ker_0.1_amd64.deb
+sudo dpkg -i ker_0.1.0_amd64.deb
 # or
-sudo rpm -Uvh ker-0.1-1.x86_64.rpm
-sudo apk add --allow-untrusted ker-0.1-r0.x86_64.apk
-sudo pacman -U ker-0.1-1-x86_64.pkg.tar.zst
+sudo rpm -Uvh ker-0.1.0-1.x86_64.rpm
+sudo apk add --allow-untrusted ker-0.1.0-r0.x86_64.apk
+sudo pacman -U ker-0.1.0-1-x86_64.pkg.tar.zst
 ```
 
 After installation, `/usr/sbin/ker` is on root's `PATH`. Run `ker` to start the first-run wizard.
 
-Unsigned local packages still require `--trust-package` when installed through `ker upgrade --trust-package`. Typical dependencies include Python 3, python3-cryptography, GnuPG, openssl, dosfstools, e2fsprogs, xorriso, util-linux, keyutils, and bpftool. See [docs/packaging.md](docs/packaging.md) for the full matrix.
+Packages install the public release key (`/usr/lib/ker/release-keys/release.gpg`). The packager writes a detached signature only when `KER_RELEASE_GNUPGHOME` points at an offline private key. A CI build without that key still produces unsigned packages. `ker upgrade` checks `<package>.sig` with the public key. An unsigned file needs an explicit `--trust-package`. A signature that does not match the public key is rejected. Never commit a private key, a passphrase, or a secret keyring. Typical dependencies include Python 3, python3-cryptography, GnuPG, openssl, dosfstools, e2fsprogs, xorriso, util-linux, keyutils, and bpftool. See [docs/packaging.md](docs/packaging.md) for the full matrix.
 
 ## Upgrades (manual only; no automatic updates)
 
 KER never checks for or installs a new version by itself. Copy the new package onto the machine and use the package manager commands above, or:
 
 ```bash
-sudo ker upgrade --trust-package ./ker_0.1_amd64.deb
+sudo ker upgrade ./ker_0.1.0_amd64.deb
+# unsigned local file only:
+# sudo ker upgrade --trust-package ./ker_0.1.0_amd64.deb
 ```
 
 The new package takes over the previous install: keys, media, policy, and mode are kept, and any required state migrations run automatically. An upgrade **does not** turn kernel enforcement on or off, and it does not rewrite sealed media. New features come with the new package; features that need new keys must be issued later and are never written onto old media during an upgrade.
@@ -76,7 +78,7 @@ Inspect the plan with `ker upgrade --check`. Apply pending migrations after the 
 
 The full contract is in [docs/upgrade.md](docs/upgrade.md).
 
-0.1 is the first public release. If `state.json` already has kernel enforcement enabled, a reboot now restores and reattaches BPF automatically (via `ker-enforcer.service`). A host that never opted in still will not get enforcement.
+0.1.0 is the version of the first public release (numerically equal to the already published 0.1). If `state.json` already has kernel enforcement enabled, a reboot restores and reattaches BPF automatically (via `ker-enforcer.service`). A host that never opted in still will not get enforcement.
 
 ## Boot hook (`boot.pem`, fail-closed)
 
@@ -92,13 +94,15 @@ Once enforcement is on:
 
 - `ker enforce --watch` runs as a persistent systemd service and is enabled so that BPF maps are restored at boot;
 - udev triggers an immediate presence check when block devices appear or disappear, with a timer as a backup;
-- **Deny first, then verify**: removing a required medium sets `media_ok` to 0 immediately, without waiting for a mount or signature check; reinserting and a successful verify allows access again;
+- **One medium, one set of bits**: removing or failing to verify the medium that holds `ssh.pem` denies SSH only. Read, write, execute, network, and root login follow their own key media. A missing `root.pem` medium denies every selected runtime permission, because no permission can be established without it. `boot.pem` is enforced by the early-boot hook, and `admin.pem` is enforced by `ker console`.
+- **Deny first, then verify**: removing a runtime-required medium clears the bits that medium authorizes immediately, without waiting for a mount or a signature check. Reinserting it and a successful verify restores those bits.
 - Enforcement is never enabled by a package install or upgrade. Turn it off with `ker enforce --set test`.
 
 ## Cluster, console, and uninstall
 
-- Master/child cluster: `ker addnet`, `ker token`, and `ker serve` use signed join tokens and policy sync. Children fail closed if the master is lost.
-- Console and key rotation: `ker console` (admin media required). Rotation switches atomically and notifies child nodes.
+- Master/child cluster: `ker addnet`, `ker token`, and `ker serve`. A join installs a new trust anchor only after an out-of-band fingerprint (`ker addnet --fingerprint`) or after a root/admin medium already on the machine verifies that anchor. The node does not install the token's trust and then verify the token with the trust it just wrote. Children fail closed if the master is lost.
+- Console and key rotation: `ker console` (admin media required). Rotation really clears kernel enforcement before rewriting media, then restores the previous mode. BPF maps and the `ker-enforcer` units match that state.
+- Lost media: `ker console revoke-medium --drop` or `--replace /dev/...`. The remaining root medium must verify; if the root medium itself is lost, the admin medium is the proof and a replacement device is required. The new signing keys are what make the lost disk stop verifying. There is no separate CRL.
 - Uninstall: `ker uninstall` requires root and verification of the root medium plus every permission medium. A master can dispatch a signed uninstall to online children; offline children must be uninstalled locally.
 
 ## Build and test

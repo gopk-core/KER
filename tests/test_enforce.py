@@ -73,13 +73,14 @@ class RefreshDenyFirstTests(unittest.TestCase):
 
     def test_missing_media_denies_without_verify(self):
         st = self._state()
+        medium = st['media'][0]
         with patch('ker.enforce.load_state', return_value=st), \
              patch('ker.enforce.may_load_bpf', return_value=True), \
              patch('ker.enforce._ensure_bpf_if_enforcing', return_value=True), \
-             patch('ker.enforce.media_present', return_value=(False, ['/dev/disk/by-id/usb-KER-PERM'])), \
+             patch('ker.enforce.runtime_presence', return_value=([], [medium], [], [medium])), \
              patch('ker.enforce.update_maps') as maps, \
              patch('ker.enforce.read_maps', return_value={'enforcement': True, 'media_ok': False, 'deny_mask': 0}), \
-             patch('ker.enforce.verify_all') as verify:
+             patch('ker.enforce.verify_each') as verify:
             r = apply_presence(verify_if_present=True)
         verify.assert_not_called()
         maps.assert_called_once()
@@ -90,13 +91,14 @@ class RefreshDenyFirstTests(unittest.TestCase):
 
     def test_presence_only_skips_verify_when_already_allowed(self):
         st = self._state()
+        medium = st['media'][0]
         with patch('ker.enforce.load_state', return_value=st), \
              patch('ker.enforce.may_load_bpf', return_value=True), \
              patch('ker.enforce._ensure_bpf_if_enforcing', return_value=True), \
-             patch('ker.enforce.media_present', return_value=(True, [])), \
+             patch('ker.enforce.runtime_presence', return_value=([medium], [], [medium], [])), \
              patch('ker.enforce.update_maps') as maps, \
              patch('ker.enforce.read_maps', return_value={'enforcement': True, 'media_ok': True, 'deny_mask': 0}), \
-             patch('ker.enforce.verify_all') as verify:
+             patch('ker.enforce.verify_each') as verify:
             r = apply_presence(verify_if_present=False)
         verify.assert_not_called()
         maps.assert_not_called()
@@ -105,13 +107,14 @@ class RefreshDenyFirstTests(unittest.TestCase):
 
     def test_all_present_and_denied_runs_verify_to_allow(self):
         st = self._state()
+        medium = st['media'][0]
         with patch('ker.enforce.load_state', return_value=st), \
              patch('ker.enforce.may_load_bpf', return_value=True), \
              patch('ker.enforce._ensure_bpf_if_enforcing', return_value=True), \
-             patch('ker.enforce.media_present', return_value=(True, [])), \
+             patch('ker.enforce.runtime_presence', return_value=([medium], [], [medium], [])), \
              patch('ker.enforce.update_maps') as maps, \
              patch('ker.enforce.read_maps', return_value={'enforcement': True, 'media_ok': False, 'deny_mask': 0}), \
-             patch('ker.enforce.verify_all', return_value={'ok': True}), \
+             patch('ker.enforce.verify_each', return_value={'ok': True, 'missing': [], 'failed': [], 'results': []}), \
              patch('ker.enforce._flock') as flock:
             flock.return_value.__enter__ = lambda s: None
             flock.return_value.__exit__ = lambda s, *a: False
@@ -130,13 +133,70 @@ class RefreshDenyFirstTests(unittest.TestCase):
         self.assertTrue(r.get('skipped'))
 
     def test_root_commands_still_denied_when_media_missing(self):
+        from ker.enforce import path_is_allowed_exec
         mask = (1 << 0) | (1 << 1) | (1 << 2)  # run|read|write
         self.assertTrue(would_deny(enforcement=True, media_ok=False,
                                    deny_mask_value=mask, bit=1 << 1, allowed=False))
         self.assertFalse(is_allowed_comm('bash'))
         self.assertFalse(is_allowed_comm('cat'))
-        self.assertTrue(is_allowed_comm('ker'))
-        self.assertTrue(is_allowed_comm('systemd-udevd'))
+        self.assertFalse(is_allowed_comm('systemd'))
+        self.assertFalse(path_is_allowed_exec('/tmp/systemd'))
+        self.assertTrue(path_is_allowed_exec('/usr/lib/systemd/systemd-udevd'))
+
+    def test_one_permission_medium_denies_only_its_bits(self):
+        from ker.enforce import BIT, bits_for_medium, denied_bits
+        st = {
+            'initialized': True,
+            'kernel_enforcement': True,
+            'permissions': ['read', 'write', 'run', 'network', 'ssh', 'rootuser'],
+            'media': [
+                {'path': '/dev/root', 'keys': ['root.pem', 'read.pem', 'write.pem', 'run.pem', 'network.pem', 'rootuser.pem'], 'role': 'root'},
+                {'path': '/dev/ssh', 'keys': ['ssh.pem'], 'role': 'keys'},
+                {'path': '/dev/admin', 'keys': ['admin.pem'], 'role': 'admin'},
+            ],
+        }
+        root, ssh, admin = st['media']
+        self.assertEqual(bits_for_medium(ssh, st), BIT['ssh'])
+        self.assertEqual(bits_for_medium(admin, st), 0)
+        self.assertEqual(bits_for_medium(root, st),
+                         BIT['read'] | BIT['write'] | BIT['run'] | BIT['network'] | BIT['ssh'] | BIT['rootuser'])
+        ssh_only = denied_bits(st, [ssh])
+        self.assertEqual(ssh_only, BIT['ssh'])
+        self.assertFalse(ssh_only & BIT['read'])
+        self.assertFalse(ssh_only & BIT['write'])
+        self.assertFalse(ssh_only & BIT['run'])
+        self.assertFalse(ssh_only & BIT['network'])
+        self.assertEqual(denied_bits(st, [admin]), 0)
+        self.assertEqual(denied_bits(st, [root]), bits_for_medium(root, st))
+
+        with patch('ker.enforce.load_state', return_value=st), \
+             patch('ker.enforce.may_load_bpf', return_value=True), \
+             patch('ker.enforce._ensure_bpf_if_enforcing', return_value=True), \
+             patch('ker.enforce.runtime_presence', return_value=([root], [ssh], [root, admin], [ssh])), \
+             patch('ker.enforce.update_maps') as maps, \
+             patch('ker.enforce.read_maps', return_value={'enforcement': True, 'media_ok': True, 'deny_mask': 0}), \
+             patch('ker.enforce.verify_each') as verify:
+            r = apply_presence(verify_if_present=True)
+        verify.assert_not_called()
+        self.assertEqual(maps.call_args.kwargs['deny_mask_value'], BIT['ssh'])
+        self.assertFalse(maps.call_args.kwargs['media_ok'])
+        self.assertEqual(r['denied_bits'], BIT['ssh'])
+
+    def test_may_mask_matches_kernel_constants(self):
+        from ker.enforce import BIT, classify_file_mask
+        src = (_Path(__file__).resolve().parents[1] / 'src' / 'bpf' / 'ker.bpf.c').read_text()
+        fn = src.split('SEC("lsm/file_permission")', 1)[1].split('SEC(', 1)[0]
+        self.assertIn('MAY_EXEC', fn)
+        self.assertIn('BIT_RUN', fn)
+        self.assertNotIn('bits |= BIT_READ', fn.split('MAY_READ')[0])
+        self.assertEqual(classify_file_mask(0x01), BIT['run'])
+        self.assertEqual(classify_file_mask(0x02), BIT['write'])
+        self.assertEqual(classify_file_mask(0x04), BIT['read'])
+        self.assertEqual(classify_file_mask(0x01 | 0x04), BIT['run'] | BIT['read'])
+        self.assertEqual(classify_file_mask(0x02 | 0x04), BIT['write'] | BIT['read'])
+        self.assertEqual(classify_file_mask(0x08), BIT['write'])
+        self.assertEqual(classify_file_mask(0), 0)
+        self.assertEqual(classify_file_mask(0x01 | 0x02 | 0x04), BIT['run'] | BIT['write'] | BIT['read'])
 
 
 class BootRestoreTests(unittest.TestCase):
@@ -170,9 +230,9 @@ class BootRestoreTests(unittest.TestCase):
         with patch('ker.enforce.load_state', return_value=st), \
              patch('ker.enforce.may_load_bpf', return_value=True), \
              patch('ker.enforce._ensure_bpf_if_enforcing', return_value=True) as ens, \
-             patch('ker.enforce.media_present', return_value=(True, [])), \
+             patch('ker.enforce.runtime_presence', return_value=([], [], [], [])), \
              patch('ker.enforce.read_maps', side_effect=[None, {'media_ok': True}]), \
-             patch('ker.enforce.verify_all', return_value={'ok': True}), \
+             patch('ker.enforce.verify_each', return_value={'ok': True, 'missing': [], 'failed': [], 'results': []}), \
              patch('ker.enforce._flock', return_value=nullcontext()), \
              patch('ker.enforce._push_maps') as push:
             r = apply_presence(verify_if_present=False)

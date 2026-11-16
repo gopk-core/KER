@@ -84,7 +84,10 @@ def sign_bytes(data: bytes, keys: dict) -> tuple[bytes, bytes]:
         return gpg_sig.read_bytes(), rsa_sig.read_bytes()
 
 
-def verify_bytes(data: bytes, gpg_sig: bytes, rsa_sig: bytes, keys: dict) -> None:
+def verify_bytes(data: bytes, gpg_sig: bytes, rsa_sig: bytes, keys: dict,
+                 *, keyring: Path | None = None, cert: Path | None = None) -> None:
+    keyring = Path(keyring) if keyring else (TRUST_DIR / 'media.gpg')
+    cert = Path(cert) if cert else (TRUST_DIR / 'kernel-cert.pem')
     with tempfile.TemporaryDirectory(prefix='ker-vfy-') as tmp:
         src = Path(tmp) / 'data'
         sig = Path(tmp) / 'data.sig'
@@ -93,7 +96,7 @@ def verify_bytes(data: bytes, gpg_sig: bytes, rsa_sig: bytes, keys: dict) -> Non
         sig.write_bytes(gpg_sig)
         ksig.write_bytes(rsa_sig)
         r = subprocess.run(
-            ['gpgv', '--keyring', str(TRUST_DIR / 'media.gpg'), str(sig), str(src)],
+            ['gpgv', '--keyring', str(keyring), str(sig), str(src)],
             capture_output=True, text=True, timeout=20,
         )
         if r.returncode:
@@ -101,7 +104,7 @@ def verify_bytes(data: bytes, gpg_sig: bytes, rsa_sig: bytes, keys: dict) -> Non
         # openssl dgst -verify wants a public key, not an X.509 certificate
         pub = Path(tmp) / 'pub.pem'
         _run([
-            'openssl', 'x509', '-in', str(TRUST_DIR / 'kernel-cert.pem'),
+            'openssl', 'x509', '-in', str(cert),
             '-pubkey', '-noout', '-out', str(pub),
         ])
         r = subprocess.run(

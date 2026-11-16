@@ -3,22 +3,19 @@
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_tracing.h>
 
-/* Global flag + per-category deny when enforcement is on and media is missing.
+/* Global flag + per-category deny when enforcement is on.
  *
- * Critical system services stay usable so the machine does not fall apart
- * and so reinserting media can recover enforcement maps. User/workload
- * read, write and exec are still denied when the matching media are gone.
+ * media_ok == 1 means no runtime permission bit is currently denied.
+ * deny_mask lists the bits to deny when media_ok == 0. Removing one
+ * permission medium denies only the bits that medium authorizes.
  *
- * Exec is judged by the *target* basename (the program being started), not
- * the current comm. Judging by current comm would allow every command
- * launched from bash, and would deny journald/udevd started via
- * systemd-executor.
+ * Allowlisting is by inode+device of concrete executable paths, filled
+ * from userspace (ker.enforce.ALLOWED_EXEC_PATHS) into allow_inos.
+ * Comm / dentry basename is not an authorization: a binary renamed to
+ * systemd must not pass, and /usr/lib/ker/ as a directory is not allowed.
  *
- * TASK_COMM_LEN is 16 bytes including the trailing NUL, so names longer
- * than 15 characters are matched in truncated form:
- *   systemd-journald  -> systemd-journal
- *   systemd-executor  -> systemd-executo
- *   systemd-shutdown  -> systemd-shutdow
+ * Linux MAY_* values (include/linux/fs.h):
+ *   MAY_EXEC 0x1, MAY_WRITE 0x2, MAY_READ 0x4, MAY_APPEND 0x8.
  *
  * Never turns another LSM's denial into an allow.
  */
@@ -37,6 +34,11 @@ struct cfg {
 #define BIT_ROOTUSER (1U << 5)
 #define BIT_SSH      (1U << 6)
 
+#define MAY_EXEC     0x01
+#define MAY_WRITE    0x02
+#define MAY_READ     0x04
+#define MAY_APPEND   0x08
+
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
@@ -44,192 +46,84 @@ struct {
     __type(value, struct cfg);
 } cfg_map SEC(".maps");
 
-static __always_inline int comm_eq(const char *c, const char *s)
-{
-    #pragma unroll
-    for (int i = 0; i < 16; i++) {
-        if (c[i] != s[i])
-            return 0;
-        if (s[i] == 0)
-            return 1;
-    }
-    return 1;
-}
-
-/* Keep this list in sync with ker.enforce.ALLOWED_COMMS. */
-static __always_inline int is_allowed_name(const char *c)
-{
-    if (comm_eq(c, "systemd") ||
-        comm_eq(c, "init") ||
-        comm_eq(c, "systemd-journal") ||
-        comm_eq(c, "systemd-udevd") ||
-        comm_eq(c, "systemd-executo") ||
-        comm_eq(c, "udev-worker") ||
-        comm_eq(c, "systemd-udev-wo") ||
-        comm_eq(c, "dbus-daemon") ||
-        comm_eq(c, "dbus-broker") ||
-        comm_eq(c, "dbus-broker-lau") ||
-        comm_eq(c, "ker") ||
-        comm_eq(c, "ker-enforcer") ||
-        comm_eq(c, "ker-sync") ||
-        comm_eq(c, "ker-boot-check") ||
-        comm_eq(c, "ker-python") ||
-        comm_eq(c, "ata_id") ||
-        comm_eq(c, "scsi_id") ||
-        comm_eq(c, "usb_id") ||
-        comm_eq(c, "blkid") ||
-        comm_eq(c, "cdrom_id") ||
-        comm_eq(c, "timeout") ||
-        comm_eq(c, "gpgv") ||
-        comm_eq(c, "openssl") ||
-        comm_eq(c, "bpftool") ||
-        comm_eq(c, "mount") ||
-        comm_eq(c, "umount") ||
-        comm_eq(c, "udevadm") ||
-        comm_eq(c, "systemctl") ||
-        comm_eq(c, "reboot") ||
-        comm_eq(c, "poweroff") ||
-        comm_eq(c, "halt") ||
-        comm_eq(c, "shutdown") ||
-        comm_eq(c, "systemd-shutdow"))
-        return 1;
-    return 0;
-}
-
-static __always_inline int allowed_comm(void)
-{
-    char c[16] = {};
-    bpf_get_current_comm(&c, sizeof(c));
-    return is_allowed_name(c);
-}
-
-static __always_inline void basename16(char dst[16], const char *path)
-{
-    char tmp[16] = {};
-    int sl = 0;
-
-    #pragma unroll
-    for (int i = 0; i < 127; i++) {
-        char ch = path[i];
-        if (ch == 0)
-            break;
-        if (ch == '/') {
-            sl = 0;
-            #pragma unroll
-            for (int j = 0; j < 16; j++)
-                tmp[j] = 0;
-            continue;
-        }
-        if (sl < 15) {
-            tmp[sl] = ch;
-            sl++;
-        }
-    }
-    #pragma unroll
-    for (int i = 0; i < 16; i++)
-        dst[i] = tmp[i];
-}
-
-static __always_inline int read_cstr(char *dst, int size, const char *src)
-{
-    long n;
-    if (!src || size <= 0)
-        return 0;
-    n = bpf_probe_read_kernel_str(dst, size, src);
-    if (n > 0)
-        return 1;
-    n = bpf_probe_read_user_str(dst, size, src);
-    return n > 0;
-}
-
-static __always_inline int starts_with(const char *s, const char *pfx)
-{
-    #pragma unroll
-    for (int i = 0; i < 24; i++) {
-        if (pfx[i] == 0)
-            return 1;
-        if (s[i] != pfx[i])
-            return 0;
-    }
-    return 1;
-}
-
-/* Exec allow is based on the target path/basename, never the parent comm.
- * Prefixes keep systemd and KER helpers startable without opening a general shell.
+/* One slot per concrete allowed path. used=0 slots are ignored.
+ * Userspace rewrites every slot whenever maps are updated.
  */
-static __always_inline int path_is_allowed(const char *path)
+struct ino_slot {
+    __u64 ino;
+    __u32 dev;
+    __u32 used;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 64);
+    __type(key, __u32);
+    __type(value, struct ino_slot);
+} allow_inos SEC(".maps");
+
+static __always_inline int ino_allowed(__u64 ino, __u32 dev)
 {
-    /* KER helpers under /usr/lib/ker/ stay startable when media is missing,
-     * except the exact path /usr/lib/ker/ker-probe, which is a user-facing
-     * checker and must follow media_ok. Compare with constant offsets only;
-     * a generic basename walk is too expensive for the verifier.
-     */
-    if (starts_with(path, "/usr/lib/ker/")) {
-        const char *probe = "ker-probe";
-        int match = 1;
-        #pragma unroll
-        for (int i = 0; i < 9; i++) {
-            if (path[13 + i] != probe[i])
-                match = 0;
-        }
-        if (match && path[22] == 0)
-            return 0;
-        return 1;
+    #pragma unroll
+    for (int i = 0; i < 64; i++) {
+        __u32 k = i;
+        struct ino_slot *s = bpf_map_lookup_elem(&allow_inos, &k);
+        if (!s || !s->used)
+            continue;
+        if (s->ino == ino && s->dev == dev)
+            return 1;
     }
-    if (starts_with(path, "/usr/lib/systemd/") ||
-        starts_with(path, "/lib/systemd/") ||
-        starts_with(path, "/usr/lib/udev/") ||
-        starts_with(path, "/lib/udev/") ||
-        starts_with(path, "/usr/sbin/ker") ||
-        starts_with(path, "/usr/bin/systemctl") ||
-        starts_with(path, "/bin/systemctl") ||
-        starts_with(path, "/usr/bin/udevadm") ||
-        starts_with(path, "/bin/udevadm") ||
-        starts_with(path, "/sbin/udevadm") ||
-        starts_with(path, "/usr/sbin/udevadm") ||
-        starts_with(path, "/usr/sbin/bpftool") ||
-        starts_with(path, "/usr/bin/bpftool") ||
-        starts_with(path, "/bin/mount") ||
-        starts_with(path, "/sbin/mount") ||
-        starts_with(path, "/usr/bin/mount") ||
-        starts_with(path, "/usr/sbin/mount") ||
-        starts_with(path, "/bin/umount") ||
-        starts_with(path, "/sbin/umount") ||
-        starts_with(path, "/usr/bin/umount") ||
-        starts_with(path, "/usr/sbin/umount") ||
-        starts_with(path, "/sbin/reboot") ||
-        starts_with(path, "/usr/sbin/reboot") ||
-        starts_with(path, "/sbin/poweroff") ||
-        starts_with(path, "/usr/sbin/poweroff") ||
-        starts_with(path, "/sbin/halt") ||
-        starts_with(path, "/usr/sbin/halt") ||
-        starts_with(path, "/sbin/shutdown") ||
-        starts_with(path, "/usr/sbin/shutdown"))
-        return 1;
     return 0;
 }
 
+static __always_inline int file_allowed(struct file *file)
+{
+    struct inode *inode;
+    struct super_block *sb;
+    __u64 ino;
+    __u32 dev;
+
+    if (!file)
+        return 0;
+    inode = BPF_CORE_READ(file, f_inode);
+    if (!inode)
+        return 0;
+    sb = BPF_CORE_READ(inode, i_sb);
+    if (!sb)
+        return 0;
+    ino = BPF_CORE_READ(inode, i_ino);
+    dev = BPF_CORE_READ(sb, s_dev);
+    return ino_allowed(ino, dev);
+}
+
+/* Exec allow is the opened file's inode, never the dentry basename and
+ * never the parent comm. A shebang records both the script inode
+ * (/usr/sbin/ker) and the interpreter inode (/usr/lib/ker/ker-python),
+ * so the packaging interpreter name still works without allowing python3.
+ */
 static __always_inline int allowed_exec(struct linux_binprm *bprm)
 {
-    char path[128] = {};
-    char name[16] = {};
-    const char *fn;
+    struct file *file;
 
-    fn = BPF_CORE_READ(bprm, filename);
-    if (read_cstr(path, sizeof(path), fn) && path_is_allowed(path))
-        return 1;
+    file = BPF_CORE_READ(bprm, file);
+    return file_allowed(file);
+}
 
-    /* dentry name is already a basename (TASK_COMM_LEN-sized). */
-    if (read_cstr(name, sizeof(name),
-                  (const char *)BPF_CORE_READ(bprm, file, f_path.dentry, d_name.name)) &&
-        is_allowed_name(name))
-        return 1;
+/* Post-exec hooks must not trust the task comm. After a renamed exec the
+ * comm is the new basename. The executable inode is stable.
+ */
+static __always_inline int allowed_current(void)
+{
+    struct task_struct *task;
+    struct mm_struct *mm;
+    struct file *exe;
 
-    __builtin_memset(path, 0, sizeof(path));
-    fn = BPF_CORE_READ(bprm, interp);
-    if (read_cstr(path, sizeof(path), fn) && path_is_allowed(path))
-        return 1;
-    return 0;
+    task = (struct task_struct *)bpf_get_current_task();
+    mm = BPF_CORE_READ(task, mm);
+    if (!mm)
+        return 0;
+    exe = BPF_CORE_READ(mm, exe_file);
+    return file_allowed(exe);
 }
 
 static __always_inline int decide(__u32 bit, int ret, int allowed)
@@ -264,34 +158,39 @@ SEC("lsm/file_permission")
 int BPF_PROG(ker_io, struct file *file, int mask, int ret)
 {
     __u32 bits = 0;
-    if (mask & 0x01) /* MAY_EXEC is handled in bprm; MAY_READ=4 MAY_WRITE=2 vary */
-        bits |= BIT_READ;
-    if (mask & 0x02)
+    /* MAY_EXEC is the execute bit, the same class as bprm / BIT_RUN.
+     * Combined masks (read+write, exec+read, append) keep every class.
+     */
+    if (mask & MAY_EXEC)
+        bits |= BIT_RUN;
+    if (mask & MAY_WRITE)
         bits |= BIT_WRITE;
-    if (mask & 0x04)
+    if (mask & MAY_READ)
         bits |= BIT_READ;
+    if (mask & MAY_APPEND)
+        bits |= BIT_WRITE;
     if (!bits)
-        bits = BIT_READ;
-    return decide(bits, ret, allowed_comm());
+        return ret;
+    return decide(bits, ret, allowed_current());
 }
 
 SEC("lsm/file_open")
 int BPF_PROG(ker_open, struct file *file, int ret)
 {
-    return decide(BIT_READ | BIT_WRITE, ret, allowed_comm());
+    return decide(BIT_READ | BIT_WRITE, ret, allowed_current());
 }
 
 SEC("lsm/task_fix_setuid")
 int BPF_PROG(ker_setuid, struct cred *new, const struct cred *old, int flags, int ret)
 {
     __u32 uid = BPF_CORE_READ(new, euid.val);
-    return uid == 0 ? decide(BIT_ROOTSU, ret, allowed_comm()) : ret;
+    return uid == 0 ? decide(BIT_ROOTSU, ret, allowed_current()) : ret;
 }
 
 SEC("lsm/socket_connect")
 int BPF_PROG(ker_connect, struct socket *sock, struct sockaddr *addr, int addrlen, int ret)
 {
-    return decide(BIT_NETWORK, ret, allowed_comm());
+    return decide(BIT_NETWORK, ret, allowed_current());
 }
 
 char LICENSE[] SEC("license") = "GPL";

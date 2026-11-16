@@ -19,9 +19,11 @@ CRYPTO_EPOCH = 1
 MIN_UPGRADE_FROM_PACKAGE = '0.1.0'
 MIN_STATE_SCHEMA = 0
 
-# Unreleased development versions superseded by the first public release (0.1).
-# 0.1 may take these over; they are not treated as a downgrade. Do not reuse
-# these numbers for a later public release.
+# Unreleased development versions superseded by the first public release.
+# The public line is 0.1.0. ver_tuple('0.1') == (0, 1, 0) == ver_tuple('0.1.0'),
+# so an already-published 0.1 install compares equal and can be taken over.
+# 0.1.0 may also take the unreleased predecessors below; they are not a
+# downgrade. Do not reuse these numbers for a later public release.
 UNRELEASED_PREDECESSORS = {
     (0, 2, 0),
     (0, 3, 0),

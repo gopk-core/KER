@@ -18,7 +18,7 @@ KER 是长期稳定、不自动更新的系统。新版本只能由管理员手�
 
 | 字段 | 含义 | 当前 |
 | --- | --- | --- |
-| `package_version` | 软件包语义化版本 | 0.3.0 |
+| `package_version` | 软件包语义化版本 | 0.1.0 |
 | `state_schema` | 主机 `state.json` 格式，单调整数 | 1 |
 | `media_schema` | 介质 `bundle.json` 格式 | 2 |
 | `crypto_epoch` | 密钥封装与签名算法世代 | 1 |
@@ -32,16 +32,16 @@ KER 是长期稳定、不自动更新的系统。新版本只能由管理员手�
 把软件包拷到目标机器（离线即可）：
 
 ```
-dpkg -i ker_0.3.0_all.deb
+dpkg -i ker_0.1.0_amd64.deb
 ```
 
 或：
 
 ```
-ker upgrade --trust-package ./ker_0.3.0_all.deb
+ker upgrade ./ker_0.1.0_amd64.deb
 ```
 
-`--trust-package` 用于尚未配置发行签名的本地包。若同时存在 `文件.sig` 和信任锚 `/etc/ker/trust/release.gpg`（或软件包附带的 `release-keys/release.gpg`），则按分离签名校验，不必再加该选项。
+包是按架构构建的（例如 amd64），不是 `Architecture: all`。若存在 `文件.sig`，`ker upgrade` 用已安装的公钥 `/usr/lib/ker/release-keys/release.gpg`（或 `/etc/ker/trust/release.gpg`，或 `KER_RELEASE_KEYRING`）做分离签名校验。签名不匹配就拒绝。没有私钥的构建不会产生 `.sig`；这种未签名包必须显式加 `--trust-package`。这不是“校验通过”。
 
 只检查、不改动：
 
@@ -95,20 +95,31 @@ Debian 维护脚本会在解包前做一次 shell 快照（即使旧包还没有
 - 在无法快照时继续改写已初始化主机的状态
 
 
-## 0.1
+## 0.1.0
 
-0.1 is the first public release. It does not bump `state_schema` or
-`media_schema`. An upgrade never turns kernel enforcement on or off, and
-never rewrites sealed media.
+0.1.0 is the version of the first public release. `ver_tuple("0.1")` is
+`(0, 1, 0)`, the same tuple as `0.1.0`, so an install that still says
+`0.1` compares equal and is taken over. It does not bump `state_schema`
+or `media_schema`. An upgrade never turns kernel enforcement on or off,
+and never rewrites sealed media.
+
+Unreleased development versions 0.2.0, 0.3.0, 0.4.0, 0.4.1, and 0.4.2 are
+still accepted as predecessors of this public line. Do not reuse those
+numbers for a later public release.
 
 This release includes architecture-specific packages (`.deb` / `.rpm` /
 `.apk` / `.pkg.tar.zst`), `boot.pem` early-boot hooks, SSH hooks, and a
-deny-first media presence watcher (`ker enforce --watch`). If
+deny-first media presence watcher (`ker enforce --watch`). Removing one
+permission medium clears only the bits that medium authorizes. A missing
+root medium still denies every selected runtime bit. If
 `state.json` already has `kernel_enforcement` enabled, a reboot restores
 and attaches BPF automatically via `ker-enforcer.service`. A host that
 never opted in still will not get enforcement. The fail-closed `boot.pem`
 early-boot policy is unchanged.
 
-Packages are architecture-specific, for example `ker_0.1_amd64.deb`.
+The signed object on media is `bundle.json` (hash list, GPG detached
+signature, OpenSSL RSA `ksig`). pem files are not individually signed.
+Packages are architecture-specific, for example `ker_0.1.0_amd64.deb`.
+A detached `.sig` is verified with the shipped public release key.
 Unsigned files still require `ker upgrade --trust-package`. See
 `docs/hooks.md` and `docs/packaging.md`.

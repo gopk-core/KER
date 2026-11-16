@@ -14,7 +14,7 @@ from ker.custom import validate_custom
 from ker.enforce import set_enforcement
 from ker.i18n import t
 from ker.paths import LOG_DIR, PREFIX
-from ker.rotate import rotate
+from ker.rotate import RotateError, rotate
 from ker.state import save_state, state as load_state
 from ker.testmode import verify_all
 from ker.trustcheck import secure_boot_status
@@ -172,6 +172,33 @@ def cmd_rotate(st, args) -> dict:
     return result
 
 
+def cmd_revoke_medium(st, args) -> dict:
+    """Replace or drop a missing medium. Requires the remaining root medium,
+    or the admin medium when the lost disk is root. This is the revocation
+    path: rotation retires the signing keys, so the lost disk no longer verifies.
+    """
+    replacements = {}
+    if getattr(args, 'replace', None):
+        key = getattr(args, 'media_id', None) or getattr(args, 'path', None)
+        if not key:
+            raise ConsoleError('revoke-medium --replace needs --media-id or --path')
+        replacements[key] = {'path': args.replace, 'kind': getattr(args, 'kind', None) or 'disk'}
+    if not replacements and not getattr(args, 'drop', False):
+        raise ConsoleError('revoke-medium needs --replace or --drop')
+    try:
+        result = rotate(
+            assume_replug=bool(getattr(args, 'assume_replug', False)),
+            lang=getattr(args, 'lang', 'zh-CN') or 'zh-CN',
+            allow_missing=True,
+            replacements=replacements,
+            drop_missing=bool(getattr(args, 'drop', False)),
+        )
+    except RotateError as e:
+        raise ConsoleError(str(e)) from e
+    print(json.dumps({k: v for k, v in result.items() if k != 'media'}, ensure_ascii=False, indent=2))
+    return result
+
+
 def cmd_add_permission(st, args) -> dict:
     from ker.catalog import BUILTIN_IDS
     pid = args.permission
@@ -210,6 +237,7 @@ ACTIONS = {
     'sync': cmd_sync,
     'token': cmd_token,
     'rotate': cmd_rotate,
+    'revoke-medium': cmd_revoke_medium,
     'add-permission': cmd_add_permission,
     'add-custom': cmd_add_custom,
 }
@@ -237,6 +265,13 @@ def _parser() -> argparse.ArgumentParser:
     p_tok.add_argument('--name')
     p_rot = sub.add_parser('rotate')
     p_rot.add_argument('--assume-replug', action='store_true')
+    p_rev = sub.add_parser('revoke-medium', help='revoke or replace a missing medium using remaining root or admin proof')
+    p_rev.add_argument('--path', help='recorded path of the lost medium')
+    p_rev.add_argument('--media-id', help='recorded media_id of the lost medium')
+    p_rev.add_argument('--replace', help='device path that receives the replacement medium')
+    p_rev.add_argument('--kind', default='disk')
+    p_rev.add_argument('--drop', action='store_true', help='drop lost non-root media and the permissions that lived only on them')
+    p_rev.add_argument('--assume-replug', action='store_true')
     p_ap = sub.add_parser('add-permission')
     p_ap.add_argument('permission')
     p_ac = sub.add_parser('add-custom')

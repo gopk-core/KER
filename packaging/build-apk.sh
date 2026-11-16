@@ -88,8 +88,9 @@ datahash = {datahash}
     outdir = Path(root) / "dist"
     outdir.mkdir(exist_ok=True)
     out = outdir / f"ker-{ver}-r0.{apk_arch}.apk"
-    # Unsigned APK: control + data. Install with apk add --allow-untrusted
-    # (or `ker upgrade --trust-package`).
+    # Alpine package signature is separate from KER's detached .sig.
+    # Without KER_RELEASE_GNUPGHOME this apk stays unsigned: install with
+    # `apk add --allow-untrusted`, or `ker upgrade --trust-package`.
     with out.open("wb") as f:
         f.write(ctl_bytes)
         f.write(data_bytes)

@@ -90,10 +90,11 @@ class ClusterTests(unittest.TestCase):
         env['KER_PREFIX'] = self.child.name
         env['PYTHONPATH'] = str(ROOT / 'python')
         env['KER_SYNC_TIMEOUT'] = '2'
+        fpr = state()['gpg_fingerprint']
         r = subprocess.run(
             [sys.executable, '-c',
              'from ker.cluster import join_master, child_poll\n'
-             f'join_master("127.0.0.1", {self.port}, {token!r}, name="child1")\n'],
+             f'join_master("127.0.0.1", {self.port}, {token!r}, name="child1", confirm_fingerprint={fpr!r})\n'],
             env=env, capture_output=True, text=True,
         )
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -142,9 +143,11 @@ class ClusterTests(unittest.TestCase):
         env = os.environ.copy()
         env['KER_PREFIX'] = self.child.name
         env['PYTHONPATH'] = str(ROOT / 'python')
+        from ker.state import state
+        fpr = state()['gpg_fingerprint']
         r = subprocess.run(
             [sys.executable, '-c',
-             f'from ker.cluster import join_master; join_master("127.0.0.1", {self.port}, {token!r})'],
+             f'from ker.cluster import join_master; join_master("127.0.0.1", {self.port}, {token!r}, confirm_fingerprint={fpr!r})'],
             env=env, capture_output=True, text=True,
         )
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -220,69 +223,152 @@ class ClusterTests(unittest.TestCase):
 
     def test_allowlist_and_deny_mask_policy(self):
         from ker.enforce import (
-            ALLOWED_COMMS, BIT, FORBIDDEN_COMMS, deny_mask,
-            is_allowed_comm, task_comm, would_deny,
+            ALLOWED_EXEC_PATHS, ALLOW_SLOTS, BIT, FORBIDDEN_COMMS, deny_mask,
+            executable_identity, is_allowed_comm, path_is_allowed_exec, task_comm,
+            would_deny,
         )
         src = (ROOT / 'src' / 'bpf' / 'ker.bpf.c').read_text()
-        # The BPF program is the source of truth for names actually enforced.
-        for name in ALLOWED_COMMS:
-            self.assertIn(f'"{name}"', src, name)
-            self.assertTrue(is_allowed_comm(name), name)
-            self.assertLessEqual(len(name), 15, name)
+        self.assertLessEqual(len(ALLOWED_EXEC_PATHS), ALLOW_SLOTS)
+        self.assertNotIn('d_name.name', src)
+        self.assertNotIn('comm_eq(', src)
+        self.assertNotIn('bpf_get_current_comm', src)
+        self.assertNotIn('starts_with(path, "/usr/lib/ker/")', src)
+        self.assertIn('allow_inos', src)
+        self.assertIn('i_ino', src)
+        self.assertIn('allowed_exec(bprm)', src)
+        self.assertIn('allowed_current()', src)
         for name in FORBIDDEN_COMMS:
             self.assertFalse(is_allowed_comm(name), name)
-            # A quoted exact comm in is_allowed_name would allow it.
-            self.assertNotIn(f'comm_eq(c, "{name}")', src, name)
+        self.assertFalse(is_allowed_comm('systemd'))
+        self.assertFalse(is_allowed_comm('ker-python'))
+        self.assertFalse(is_allowed_comm('ker-enforcer'))
         self.assertEqual(task_comm('systemd-journald'), 'systemd-journal')
-        self.assertEqual(task_comm('systemd-executor'), 'systemd-executo')
-        self.assertEqual(task_comm('systemd-shutdown'), 'systemd-shutdow')
-        self.assertTrue(is_allowed_comm('systemd-journald'))
-        self.assertTrue(is_allowed_comm('systemd-executor'))
-        self.assertTrue(is_allowed_comm('systemd-udevd'))
-        self.assertTrue(is_allowed_comm('ker-enforcer'))
-        self.assertTrue(is_allowed_comm('ker-python'))
-        self.assertTrue(is_allowed_comm('udev-worker'))
-        self.assertTrue(is_allowed_comm('systemd-udev-worker'))
-        self.assertEqual(task_comm('systemd-udev-worker'), 'systemd-udev-wo')
-        self.assertFalse(is_allowed_comm('bash'))
-        self.assertFalse(is_allowed_comm('cat'))
-        self.assertFalse(is_allowed_comm('python3'))
-        # Exec is judged by the target, not the parent: bash launching cat is denied.
+        # Basename alone is not an authorization, including a renamed systemd.
+        self.assertFalse(path_is_allowed_exec('/tmp/systemd'))
+        self.assertFalse(path_is_allowed_exec('/usr/lib/ker/evil'))
+        self.assertFalse(path_is_allowed_exec('/usr/lib/ker/'))
+        self.assertFalse(path_is_allowed_exec('/usr/lib/ker/ker-python-extra'))
+        self.assertFalse(path_is_allowed_exec('systemd'))
+        for path in (
+            '/usr/lib/systemd/systemd-journald',
+            '/lib/systemd/systemd-journald',
+            '/usr/lib/systemd/systemd-udevd',
+            '/usr/lib/systemd/systemd',
+            '/usr/sbin/ker',
+            '/usr/lib/ker/ker-python',
+            '/usr/lib/ker/ker-probe',
+            '/usr/lib/ker/ker-boot-check',
+            '/usr/bin/gpgv',
+            '/usr/bin/mount',
+        ):
+            self.assertTrue(path_is_allowed_exec(path), path)
+            self.assertIn(f"'{path}'", (ROOT / 'python' / 'ker' / 'enforce.py').read_text())
         mask = deny_mask(['read', 'write', 'run'])
         self.assertTrue(would_deny(enforcement=True, media_ok=False,
                                    deny_mask_value=mask, bit=BIT['run'], allowed=False))
-        self.assertTrue(would_deny(enforcement=True, media_ok=False,
-                                   deny_mask_value=mask, bit=BIT['read'], allowed=False))
-        # journald / udevd / ker-enforcer stay usable while media is missing.
-        for comm in ('systemd-journald', 'systemd-udevd', 'ker-enforcer', 'ker-python', 'bpftool'):
+        # journald, udevd, and the ker interpreter stay usable; a renamed binary does not.
+        for path in ('/usr/lib/systemd/systemd-journald', '/usr/lib/systemd/systemd-udevd', '/usr/lib/ker/ker-python'):
             self.assertFalse(
                 would_deny(enforcement=True, media_ok=False, deny_mask_value=mask,
                            bit=BIT['read'] | BIT['write'] | BIT['run'],
-                           allowed=is_allowed_comm(comm)),
-                comm,
+                           allowed=path_is_allowed_exec(path)),
+                path,
             )
-        # Reinserting media lifts the denial without changing the allowlist.
+        self.assertTrue(
+            would_deny(enforcement=True, media_ok=False, deny_mask_value=mask,
+                       bit=BIT['run'], allowed=path_is_allowed_exec('/tmp/systemd'))
+        )
         self.assertFalse(would_deny(enforcement=True, media_ok=True,
                                     deny_mask_value=mask, bit=BIT['run'], allowed=False))
-        # Test mode never denies.
         self.assertFalse(would_deny(enforcement=False, media_ok=False,
                                     deny_mask_value=mask, bit=BIT['run'], allowed=False))
-        # exec decision must look at the target program, not current comm.
-        self.assertIn('allowed_exec(bprm)', src)
-        self.assertIn('bpf_probe_read_kernel_str', src)
-        self.assertIn('bpf_probe_read_user_str', src)
-        self.assertIn('bprm, filename', src)
-        self.assertIn('/usr/lib/systemd/', src)
-        self.assertIn('/usr/lib/ker/', src)
-        from ker.enforce import ALLOWED_EXEC_PREFIXES, DENIED_EXEC_BASENAMES, path_is_allowed_exec
-        for pfx in ALLOWED_EXEC_PREFIXES:
-            self.assertIn(f'"{pfx}"', src, pfx)
-        self.assertIn('ker-probe', DENIED_EXEC_BASENAMES)
-        self.assertIn('ker-probe', src)
-        self.assertIn('path[13 + i]', src)
-        self.assertFalse(path_is_allowed_exec('/usr/lib/ker/ker-probe'))
-        self.assertTrue(path_is_allowed_exec('/usr/lib/ker/ker-python'))
-        self.assertTrue(path_is_allowed_exec('/usr/sbin/ker'))
+
+    def test_symlink_outside_allowlist_is_not_recorded(self):
+        from ker.enforce import executable_identity
+        with tempfile.TemporaryDirectory() as tmp:
+            real = Path(tmp) / 'bash'
+            real.write_text('#!/bin/sh\n')
+            link = Path(tmp) / 'ker-python'
+            link.symlink_to(real)
+            allowed = (str(link), '/usr/lib/ker/ker-python')
+            self.assertIsNone(executable_identity(str(link), allowed=allowed))
+            allowed_real = (str(link), str(real))
+            ident = executable_identity(str(link), allowed=allowed_real)
+            self.assertIsNotNone(ident)
+            self.assertEqual(ident[0], real.stat().st_ino)
+
+    def test_join_refuses_unconfirmed_trust(self):
+        self._init_master()
+        from ker.cluster import create_join_token, start_server
+        from ker.state import state
+        self.stopper = start_server('127.0.0.1', self.port)
+        token = create_join_token('127.0.0.1', self.port, name='child1')
+        fpr = state()['gpg_fingerprint']
+        env = os.environ.copy()
+        env['KER_PREFIX'] = self.child.name
+        env['PYTHONPATH'] = str(ROOT / 'python')
+        r = subprocess.run(
+            [sys.executable, '-c',
+             'from ker.cluster import ClusterError, bootstrap_from_token\n'
+             f'try:\n'
+             f'    bootstrap_from_token({token!r})\n'
+             f'except ClusterError as e:\n'
+             f'    print("REFUSED", e)\n'
+             f'else:\n'
+             f'    raise SystemExit("token installed trust with no confirmation")\n'],
+            env=env, capture_output=True, text=True,
+        )
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('REFUSED', r.stdout)
+        self.assertFalse((Path(self.child.name) / 'etc/ker/trust/media.gpg').exists())
+        r = subprocess.run(
+            [sys.executable, '-c',
+             'from ker.cluster import ClusterError, bootstrap_from_token\n'
+             f'try:\n'
+             f'    bootstrap_from_token({token!r}, confirm_fingerprint="00" * 20)\n'
+             f'except ClusterError as e:\n'
+             f'    print("MISMATCH", e)\n'
+             f'else:\n'
+             f'    raise SystemExit("wrong fingerprint was accepted")\n'],
+            env=env, capture_output=True, text=True,
+        )
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('MISMATCH', r.stdout)
+        self.assertFalse((Path(self.child.name) / 'etc/ker/trust/media.gpg').exists())
+        # The real out-of-band fingerprint is accepted and only then installed.
+        r = subprocess.run(
+            [sys.executable, '-c',
+             'from ker.cluster import bootstrap_from_token\n'
+             f'body = bootstrap_from_token({token!r}, confirm_fingerprint={fpr!r})\n'
+             f'assert body["gpg_fingerprint"] == {fpr!r}\n'
+             f'print("ACCEPTED")\n'],
+            env=env, capture_output=True, text=True,
+        )
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('ACCEPTED', r.stdout)
+        self.assertTrue((Path(self.child.name) / 'etc/ker/trust/media.gpg').is_file())
+
+    def test_media_tree_matches_only_its_own_trust(self):
+        self._init_master()
+        from ker.bundle import make_bundle, pack_media_files
+        from ker.cluster import _keys, _trust_blob, trust_matches_tree
+        from ker.protocol import b64d
+        from ker.state import state
+        st = state()
+        files = pack_media_files(make_bundle({
+            'bundle_id': 'b', 'cluster_id': st['cluster_id'], 'media_id': 'm',
+            'role': 'admin', 'gpg_fingerprint': st['gpg_fingerprint'],
+            'kernel_cert_sha256': st['kernel_cert_sha256'], 'keys': {},
+        }), {}, _keys(st))
+        dest = Path(self.master.name) / 'mounted'
+        dest.mkdir()
+        for name, data in files.items():
+            (dest / name).write_bytes(data)
+        blob = _trust_blob()
+        keyring, cert = b64d(blob['media_gpg']), b64d(blob['kernel_cert'])
+        self.assertTrue(trust_matches_tree(keyring, cert, dest))
+        (dest / 'bundle.json').write_bytes(b'tampered')
+        self.assertFalse(trust_matches_tree(keyring, cert, dest))
 
 if __name__ == '__main__':
     unittest.main()

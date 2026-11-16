@@ -84,6 +84,75 @@ def _umount(dest: Path) -> None:
                    capture_output=True, timeout=5)
 
 
+def verify_each(st: dict, devices: list[dict] | None = None, *, proof_only: bool = False) -> dict:
+    """Verify each present medium on its own.
+
+    Missing devices are reported and not mounted. A failed signature or hash
+    fails that medium only. proof_only accepts a signed bundle that cannot be
+    decrypted yet (admin proof while root.pem is absent). Otherwise a medium
+    that still needs root.pem is a failure: the permission is not established.
+    """
+    from ker.devices import resolve_media_path
+    keys = _keys_from_state(st)
+    media = list(devices if devices is not None else (st.get('media') or []))
+    missing: list[dict] = []
+    present: list[tuple[dict, str]] = []
+    for medium in media:
+        if not isinstance(medium, dict):
+            missing.append({'path': str(medium)})
+            continue
+        live = resolve_media_path(medium)
+        if not live:
+            missing.append(medium)
+        else:
+            present.append((medium, live))
+    mounts: list[Path] = []
+    root_pem = None
+    failed: list[dict] = []
+    results: list[dict] = []
+    try:
+        mounted: list[tuple[dict, Path]] = []
+        for i, (medium, live) in enumerate(present):
+            dest = MOUNT_ROOT / f'e{i}'
+            _umount(dest)
+            if not resolve_media_path(medium):
+                missing.append(medium)
+                continue
+            try:
+                _mount_ro(live, dest)
+            except Exception as e:
+                failed.append(medium)
+                results.append({'path': medium.get('path'), 'ok': False, 'error': str(e)})
+                continue
+            mounts.append(dest)
+            mounted.append((medium, dest))
+            if (dest / 'root.pem').is_file():
+                root_pem = (dest / 'root.pem').read_bytes()
+        for medium, dest in mounted:
+            try:
+                info = verify_directory(dest, keys, root_pem=root_pem)
+            except Exception as e:
+                failed.append(medium)
+                results.append({
+                    'path': medium.get('path'), 'ok': False,
+                    'error': f'{type(e).__name__}: {e}',
+                })
+                continue
+            if info.get('need_root') and not proof_only:
+                failed.append(medium)
+                results.append({'path': medium.get('path'), 'ok': False, 'error': 'ROOT_MEDIA_MISSING'})
+                continue
+            results.append({
+                'path': medium.get('path'), 'ok': True,
+                'media_id': (info.get('bundle') or {}).get('media_id'),
+                'proof_only': bool(info.get('need_root')),
+            })
+        return {'ok': not missing and not failed, 'missing': missing, 'failed': failed, 'results': results}
+    finally:
+        for dest in mounts:
+            _umount(dest)
+
+
 def verify_all(st: dict, devices: list[dict] | None = None) -> dict:
     """Mount and verify every recorded medium. Missing devices fail immediately.
 

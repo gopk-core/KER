@@ -19,7 +19,7 @@ from ker.catalog import BUILTIN_IDS
 from ker.devices import required_media_presence
 from ker.paths import PREFIX
 from ker.state import save_state, state as load_state
-from ker.testmode import verify_all
+from ker.testmode import verify_all, verify_each
 
 
 class EnforceError(RuntimeError):
@@ -37,87 +37,140 @@ BIT = {
     'ssh': 1 << 6,
 }
 
-# Must stay in sync with is_allowed_name() in src/bpf/ker.bpf.c.
-# TASK_COMM_LEN is 16 including NUL, so names longer than 15 characters
-# are stored and matched in truncated form.
-ALLOWED_COMMS = (
-    'systemd',
-    'init',
-    'systemd-journal',  # systemd-journald
-    'systemd-udevd',
-    'systemd-executo',  # systemd-executor
-    'udev-worker',
-    'systemd-udev-wo',  # systemd-udev-worker
-    'dbus-daemon',
-    'dbus-broker',
-    'dbus-broker-lau',  # dbus-broker-launch
-    'ker',
-    'ker-enforcer',
-    'ker-sync',
-    'ker-boot-check',
-    'ker-python',
-    'ata_id',
-    'scsi_id',
-    'usb_id',
-    'blkid',
-    'cdrom_id',
-    'timeout',
-    'gpgv',
-    'openssl',
-    'bpftool',
-    'mount',
-    'umount',
-    'udevadm',
-    'systemctl',
-    'reboot',
-    'poweroff',
-    'halt',
-    'shutdown',
-    'systemd-shutdow',  # systemd-shutdown
-)
-
-# Comms that must never be allowlisted: a general shell or user workload.
-# Exec targets under these prefixes are also allowed (see path_is_allowed()).
-ALLOWED_EXEC_PREFIXES = (
-    '/usr/lib/systemd/',
-    '/lib/systemd/',
-    '/usr/lib/udev/',
-    '/lib/udev/',
-    '/usr/lib/ker/',
+# Concrete executables spared while the bits they are not denied for are off.
+# BPF allow_inos is filled from this list (inode + kernel dev_t). A basename
+# match is never enough: /tmp/systemd is not systemd. The whole /usr/lib/ker/
+# directory is not allowed — only the helpers KER actually installs.
+# ker-python is a copy of the system interpreter (not a hard link) so its
+# inode does not also authorize /usr/bin/python3. The shebang
+# #!/usr/lib/ker/ker-python still runs as comm ker-python.
+# 64 slots match allow_inos in src/bpf/ker.bpf.c.
+ALLOWED_EXEC_PATHS = (
+    '/usr/lib/systemd/systemd',
+    '/lib/systemd/systemd',
+    '/usr/lib/systemd/systemd-journald',
+    '/lib/systemd/systemd-journald',
+    '/usr/lib/systemd/systemd-udevd',
+    '/lib/systemd/systemd-udevd',
+    '/usr/lib/systemd/systemd-executor',
+    '/lib/systemd/systemd-executor',
+    '/usr/lib/systemd/systemd-shutdown',
+    '/lib/systemd/systemd-shutdown',
+    '/sbin/init',
+    '/usr/sbin/init',
+    '/usr/lib/udev/ata_id',
+    '/lib/udev/ata_id',
+    '/usr/lib/udev/scsi_id',
+    '/lib/udev/scsi_id',
+    '/usr/lib/udev/cdrom_id',
+    '/lib/udev/cdrom_id',
+    '/usr/sbin/blkid',
+    '/sbin/blkid',
+    '/usr/bin/blkid',
+    '/usr/bin/udevadm',
+    '/bin/udevadm',
+    '/sbin/udevadm',
+    '/usr/sbin/udevadm',
+    '/usr/bin/dbus-daemon',
+    '/bin/dbus-daemon',
+    '/usr/bin/dbus-broker',
+    '/usr/bin/dbus-broker-launch',
     '/usr/sbin/ker',
+    '/usr/bin/ker',
+    '/usr/lib/ker/ker-python',
+    '/usr/lib/ker/ker-boot-check',
+    '/usr/lib/ker/ker-ssh-pam',
+    '/usr/lib/ker/ker-ssh-keys',
+    '/usr/lib/ker/ker-pam-probe',
+    '/usr/lib/ker/install-hooks',
+    '/usr/lib/ker/ker-probe',
+    '/usr/bin/gpgv',
+    '/bin/gpgv',
+    '/usr/bin/openssl',
+    '/usr/bin/bpftool',
+    '/usr/sbin/bpftool',
+    '/bin/mount',
+    '/usr/bin/mount',
+    '/bin/umount',
+    '/usr/bin/umount',
+    '/bin/systemctl',
+    '/usr/bin/systemctl',
+    '/usr/bin/timeout',
+    '/bin/timeout',
+    '/sbin/reboot',
+    '/usr/sbin/reboot',
+    '/sbin/poweroff',
+    '/usr/sbin/poweroff',
+    '/sbin/halt',
+    '/usr/sbin/halt',
+    '/sbin/shutdown',
+    '/usr/sbin/shutdown',
 )
 
-# Basenames under an allowed prefix that must still follow media_ok.
-DENIED_EXEC_BASENAMES = (
-    'ker-probe',
-)
+ALLOW_SLOTS = 64
 
-
-def path_is_allowed_exec(path: str) -> bool:
-    """Userspace mirror of BPF path_is_allowed()."""
-    pth = path or ''
-    base = pth.rsplit('/', 1)[-1]
-    if base in DENIED_EXEC_BASENAMES:
-        return False
-    for pfx in ALLOWED_EXEC_PREFIXES:
-        if pth.startswith(pfx):
-            return True
-    return False
-
+# Names that must never be treated as an allow by themselves.
 FORBIDDEN_COMMS = (
     'bash', 'sh', 'dash', 'zsh', 'fish',
     'cat', 'ls', 'python3', 'python', 'sudo', 'su',
     'login', 'agetty', 'sshd', 'nginx', 'httpd',
+    'systemd',
 )
 
 
 def task_comm(name: str) -> str:
-    """Return the 15-character TASK_COMM_LEN form used by the kernel and BPF."""
+    """Return the 15-character TASK_COMM_LEN form used by the kernel."""
     return (name or '')[:15]
 
 
 def is_allowed_comm(name: str) -> bool:
-    return task_comm(name) in ALLOWED_COMMS
+    """Comm is not an authorization. Always false.
+
+    A process whose comm is systemd, ker-python, or ker-enforcer is allowed
+    only when its executable inode was recorded from ALLOWED_EXEC_PATHS.
+    """
+    return False
+
+
+def path_is_allowed_exec(path: str) -> bool:
+    """True only for a concrete allowed path, not a basename or a directory prefix."""
+    raw = path or ''
+    if not raw.startswith('/') or raw.endswith('/'):
+        return False
+    if raw in ALLOWED_EXEC_PATHS:
+        return True
+    try:
+        real = os.path.realpath(raw)
+    except OSError:
+        return False
+    return real in ALLOWED_EXEC_PATHS
+
+
+def kernel_dev(st_dev: int) -> int:
+    """Convert a userspace stat st_dev to the kernel dev_t stored in super_block.s_dev."""
+    major = os.major(st_dev)
+    minor = os.minor(st_dev)
+    return ((major & 0xFFFFFFFF) << 20) | (minor & 0xFFFFF)
+
+
+def executable_identity(path: str, allowed: tuple[str, ...] | None = None) -> tuple[int, int] | None:
+    """Inode and kernel dev for an allowlisted path, or None.
+
+    A symlink is recorded only when its realpath is itself allowlisted
+    (so /sbin/init -> systemd counts, and ker-python -> bash does not).
+    """
+    allowed_set = allowed if allowed is not None else ALLOWED_EXEC_PATHS
+    raw = path or ''
+    if raw not in allowed_set:
+        return None
+    try:
+        st = os.stat(raw, follow_symlinks=True)
+        real = os.path.realpath(raw)
+    except OSError:
+        return None
+    if real not in allowed_set:
+        return None
+    return int(st.st_ino), kernel_dev(st.st_dev)
 
 
 def would_deny(*, enforcement: bool, media_ok: bool, deny_mask_value: int,
@@ -136,6 +189,169 @@ def deny_mask(permissions: list[str] | None) -> int:
     mask = 0
     for p in permissions or []:
         mask |= BIT.get(p, 0)
+    return mask
+
+
+# file_permission MAY_* mirrors. Keep in lockstep with src/bpf/ker.bpf.c.
+MAY_EXEC = 0x01
+MAY_WRITE = 0x02
+MAY_READ = 0x04
+MAY_APPEND = 0x08
+
+# Keys whose documented scope is not a runtime LSM bit.
+# boot.pem: early-boot hook, fail-closed there.
+# admin.pem: ker console.
+# root.pem: foundation of every permission; handled on the medium, not as its own bit.
+_NO_BPF_KEYS = frozenset({'root.pem', 'boot.pem', 'admin.pem'})
+
+_CUSTOM_BITS = {
+    'file_read': BIT['read'],
+    'file_write': BIT['write'],
+    'file_exec': BIT['run'],
+    'command': BIT['run'],
+    'login': BIT['rootuser'],
+    'network': BIT['network'],
+    'service': BIT['run'],
+    'device': BIT['read'] | BIT['write'],
+}
+
+
+def classify_file_mask(mask: int) -> int:
+    """Map a Linux file_permission mask onto KER bits.
+
+    MAY_EXEC (0x01) is execute, the same class as bprm_check_security / BIT_RUN.
+    Combined masks keep every class that is present. An empty mask classifies
+    as no KER bit (the hook does not invent a read denial).
+    """
+    bits = 0
+    if mask & MAY_EXEC:
+        bits |= BIT['run']
+    if mask & MAY_WRITE:
+        bits |= BIT['write']
+    if mask & MAY_READ:
+        bits |= BIT['read']
+    if mask & MAY_APPEND:
+        bits |= BIT['write']
+    return bits
+
+
+def custom_bits(item: dict | None) -> int:
+    if not item:
+        return 0
+    return _CUSTOM_BITS.get(item.get('type') or '', 0)
+
+
+def policy_bits(st: dict | None) -> int:
+    """Runtime bits selected by policy (built-ins plus custom rules)."""
+    st = st or {}
+    mask = deny_mask(st.get('permissions') or [])
+    for item in st.get('custom') or []:
+        mask |= custom_bits(item)
+    return mask
+
+
+def key_bits(name: str, st: dict | None = None) -> int:
+    """Bits one key file authorizes. root/boot/admin have no LSM bit of their own."""
+    st = st or {}
+    if not name or name in _NO_BPF_KEYS:
+        return 0
+    stem = name[:-4] if name.endswith('.pem') else name
+    if stem in BIT:
+        return BIT[stem]
+    for item in st.get('custom') or []:
+        if item.get('key') == name:
+            return custom_bits(item)
+    return 0
+
+
+def medium_is_root(medium: dict | None) -> bool:
+    if not isinstance(medium, dict):
+        return False
+    role = (medium.get('role') or '').replace('+', ' ')
+    if 'root' in role.split():
+        return True
+    return 'root.pem' in (medium.get('keys') or [])
+
+
+def bits_for_medium(medium: dict, st: dict | None = None) -> int:
+    """Bits cleared when this medium is absent or fails verify.
+
+    Root media fail closed for every selected runtime bit: without root.pem
+    no permission can be established. Boot-only and admin-only media do not
+    (their fail-closed scope is the boot hook and the admin console).
+    A medium with no recorded keys is treated as unknown and fails closed.
+    """
+    st = st or {}
+    if not isinstance(medium, dict):
+        return policy_bits(st)
+    if medium_is_root(medium):
+        return policy_bits(st)
+    keys = list(medium.get('keys') or [])
+    if not keys and not medium.get('role'):
+        return policy_bits(st)
+    mask = 0
+    for name in keys:
+        mask |= key_bits(name, st)
+    return mask
+
+
+def denied_bits(st: dict, missing: list | None = None, failed: list | None = None) -> int:
+    mask = 0
+    for medium in list(missing or []) + list(failed or []):
+        mask |= bits_for_medium(medium, st)
+    return mask
+
+
+def presence_sets(st: dict | None = None) -> tuple[list[dict], list[dict]]:
+    """Split recorded media into (present, missing) without mounting."""
+    from ker.devices import resolve_media_path
+    st = st or load_state()
+    present: list[dict] = []
+    missing: list[dict] = []
+    for medium in st.get('media') or []:
+        if not isinstance(medium, dict):
+            missing.append({'path': str(medium)})
+            continue
+        if resolve_media_path(medium):
+            present.append(medium)
+        else:
+            missing.append(medium)
+    return present, missing
+
+
+def runtime_required(medium: dict, st: dict | None = None) -> bool:
+    """Root and any medium that authorizes a runtime bit.
+
+    Admin-only and boot-only disks stay out of the BPF presence gate; the
+    console and the boot hook enforce those scopes themselves.
+    """
+    if medium_is_root(medium):
+        return True
+    return bits_for_medium(medium, st) != 0
+
+
+def runtime_presence(st: dict | None = None) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
+    """Return (runtime_present, runtime_missing, all_present, all_missing)."""
+    st = st or load_state()
+    present, missing = presence_sets(st)
+    req_present = [m for m in present if runtime_required(m, st)]
+    req_missing = [m for m in missing if runtime_required(m, st)]
+    return req_present, req_missing, present, missing
+
+
+def _previous_denied(current: dict | None, policy: int) -> int:
+    """Bits the pinned map is currently denying.
+
+    A zeroed map (media_ok=0 and deny_mask=0) while policy bits exist has
+    not been verified yet, so it fails closed for the whole policy.
+    """
+    if not current:
+        return policy
+    if current.get('media_ok'):
+        return 0
+    mask = int(current.get('deny_mask') or 0)
+    if mask == 0 and policy:
+        return policy
     return mask
 
 
@@ -216,6 +432,10 @@ def load_bpf() -> None:
     # PIN_DIR itself is created before load; success is a pinned cfg map.
     if not _cfg_pin():
         raise EnforceError((err or 'bpftool load failed')[-2000:])
+    try:
+        refresh_allow_maps()
+    except EnforceError:
+        pass
 
 
 def unload_bpf() -> None:
@@ -260,16 +480,58 @@ def bpftool_map_update_argv(pin: Path | str, key: bytes, value: bytes) -> list[s
     ]
 
 
-def update_maps(*, enforcement: bool, media_ok: bool, permissions: list[str] | None) -> None:
-    if not may_load_bpf():
-        raise EnforceError('BPF map update refused on bare-metal host')
-    key = struct.pack('I', 0)
-    value = struct.pack('IIII', 1 if enforcement else 0, 1 if media_ok else 0, deny_mask(permissions), 0)
-    mp = _map_path()
-    cmd = bpftool_map_update_argv(mp, key, value)
+def _map_update(pin: Path, key: bytes, value: bytes) -> None:
+    cmd = bpftool_map_update_argv(pin, key, value)
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode:
         raise EnforceError((r.stderr or r.stdout or 'bpftool map update failed').strip())
+
+
+def _path_slot_count() -> int:
+    if len(ALLOWED_EXEC_PATHS) > ALLOW_SLOTS:
+        raise EnforceError('allowlisted executable paths exceed BPF allow_inos slots')
+    return ALLOW_SLOTS
+
+
+def refresh_allow_maps() -> None:
+    """Rewrite allow_inos from ALLOWED_EXEC_PATHS. No-op when the map is not pinned.
+
+    Does not load BPF. A symlink is recorded only when its realpath is itself
+    on the allowlist, so a helper path pointing at bash does not authorize bash.
+    """
+    if not may_load_bpf():
+        return
+    pin = PIN_DIR / 'allow_inos'
+    if not _pin_exists(pin):
+        return
+    slots = _path_slot_count()
+    paths = list(ALLOWED_EXEC_PATHS)
+    for i in range(slots):
+        path = paths[i] if i < len(paths) else ''
+        ident = executable_identity(path) if path else None
+        if ident is None:
+            value = struct.pack('QII', 0, 0, 0)
+        else:
+            ino, dev = ident
+            value = struct.pack('QII', ino, dev & 0xFFFFFFFF, 1)
+        _map_update(pin, struct.pack('I', i), value)
+
+
+def update_maps(*, enforcement: bool, media_ok: bool, permissions: list[str] | None,
+                deny_mask_value: int | None = None) -> None:
+    if not may_load_bpf():
+        raise EnforceError('BPF map update refused on bare-metal host')
+    key = struct.pack('I', 0)
+    mask = deny_mask(permissions) if deny_mask_value is None else int(deny_mask_value)
+    value = struct.pack('IIII', 1 if enforcement else 0, 1 if media_ok else 0, mask, 0)
+    mp = _map_path()
+    _map_update(mp, key, value)
+    # Best-effort: an older pinned object may not have allow_inos yet.
+    try:
+        refresh_allow_maps()
+    except EnforceError:
+        if _pin_exists(PIN_DIR / 'allow_inos'):
+            raise
 
 
 
@@ -429,11 +691,23 @@ def _recover_sshd() -> None:
             pass
 
 
-def _push_maps(st: dict, media_ok_flag: bool, *, recover_ssh: bool = False) -> None:
+def _push_maps(st: dict, denied: int, *, recover_ssh: bool = False) -> None:
+    """Push the bits that are denied right now.
+
+    media_ok is 1 only when nothing is denied. The mask then still records the
+    armed policy bits; decide() ignores the mask while media_ok is set.
+    When some bits are denied, the mask is exactly those bits — not every
+    permission the policy selected.
+    """
+    policy = policy_bits(st)
+    denied = int(denied) & 0xFFFFFFFF
+    media_ok_flag = denied == 0
+    mask = policy if media_ok_flag else denied
     update_maps(
         enforcement=True,
         media_ok=media_ok_flag,
         permissions=st.get('permissions') or [],
+        deny_mask_value=mask,
     )
     if not media_ok_flag:
         try:
@@ -444,20 +718,31 @@ def _push_maps(st: dict, media_ok_flag: bool, *, recover_ssh: bool = False) -> N
         _recover_sshd()
 
 
-def apply_presence(*, verify_if_present: bool = False) -> dict:
-    """Fail-closed presence check. On a missing required medium, set media_ok=0
-    immediately and return — never mount, never verify.
+def _paths(media: list[dict]) -> list[str]:
+    return [(m.get('path') if isinstance(m, dict) else str(m)) or '(no-path)' for m in media]
 
-    When every recorded medium is present and verify_if_present is true (or the
-    map is not already allowed), run the full verify and flip media_ok back to 1
-    only if signatures are good.
+
+def apply_presence(*, verify_if_present: bool = False) -> dict:
+    """Fail-closed, per-medium presence check.
+
+    When a runtime-required medium disappears, clear only the bits that medium
+    authorizes and return immediately — never mount, never verify. Root media
+    clear every selected runtime bit. Admin-only and boot-only media do not
+    (those scopes are the console and the early-boot hook).
+
+    When every runtime-required medium is present and verify_if_present is
+    true (or the map is not already fully allowed), verify and restore only
+    the bits whose media verified.
     """
     st = load_state()
+    req_present, req_missing, _present, missing = runtime_presence(st)
+    missing_paths = _paths(missing)
+    runtime_paths = _paths(req_missing)
     if not st.get('kernel_enforcement'):
-        present, missing = media_present(st)
         return {
             'ok': True, 'skipped': True, 'media_ok': None,
-            'present': present, 'missing': missing,
+            'present': not req_missing, 'missing': missing_paths,
+            'runtime_missing': runtime_paths,
         }
     if not may_load_bpf():
         return {'ok': False, 'error': 'host bpf not allowed'}
@@ -465,67 +750,86 @@ def apply_presence(*, verify_if_present: bool = False) -> dict:
         _ensure_bpf_if_enforcing(st)
     except EnforceError as e:
         return {'ok': False, 'error': str(e)}
-    present, missing = media_present(st)
     current = read_maps() or {}
-    if not present:
-        # Deny FIRST. Do not wait on a hung verify lock.
-        _push_maps(st, False)
+    policy = policy_bits(st)
+    if req_missing:
+        # Deny FIRST. Do not wait on a hung verify lock or a mount.
+        fresh = denied_bits(st, req_missing)
+        if current.get('media_ok'):
+            denied = fresh
+        else:
+            prev = _previous_denied(current, policy)
+            present_bits = 0
+            for medium in req_present:
+                present_bits |= bits_for_medium(medium, st)
+            denied = fresh | (prev & present_bits)
+        _push_maps(st, denied)
         return {
-            'ok': True, 'media_ok': False, 'present': False,
-            'missing': missing, 'maps': read_maps(), 'verified': False,
+            'ok': True, 'media_ok': denied == 0, 'present': False,
+            'missing': missing_paths, 'runtime_missing': runtime_paths,
+            'denied_bits': denied, 'maps': read_maps(), 'verified': False,
         }
-    need_verify = verify_if_present or (not current.get('media_ok'))
+    need_verify = verify_if_present or (not current.get('media_ok')) or _previous_denied(current, policy) != 0
     if not need_verify:
         return {
             'ok': True, 'media_ok': True, 'present': True,
-            'missing': [], 'maps': current, 'verified': False, 'unchanged': True,
+            'missing': missing_paths, 'runtime_missing': [],
+            'maps': current, 'verified': False, 'unchanged': True,
         }
     try:
         with _flock(REFRESH_LOCK, timeout=0):
-            # Recheck after getting the lock; a stick may have vanished.
-            present, missing = media_present(st)
-            if not present:
-                _push_maps(st, False)
+            req_present, req_missing, _present, missing = runtime_presence(st)
+            missing_paths = _paths(missing)
+            runtime_paths = _paths(req_missing)
+            if req_missing:
+                fresh = denied_bits(st, req_missing)
+                _push_maps(st, fresh)
                 return {
-                    'ok': True, 'media_ok': False, 'present': False,
-                    'missing': missing, 'maps': read_maps(), 'verified': False,
+                    'ok': True, 'media_ok': fresh == 0, 'present': False,
+                    'missing': missing_paths, 'runtime_missing': runtime_paths,
+                    'denied_bits': fresh, 'maps': read_maps(), 'verified': False,
                 }
-            ok = False
             verify_error = None
-            present2, missing2 = present, missing
+            report: dict = {'ok': False, 'missing': [], 'failed': [], 'results': []}
             for attempt in range(3):
                 try:
-                    ok = bool(verify_all(st).get('ok'))
+                    report = verify_each(st, devices=req_present)
                     verify_error = None
                 except Exception as e:
-                    ok = False
+                    report = {'ok': False, 'missing': [], 'failed': list(req_present), 'results': []}
                     verify_error = f'{type(e).__name__}: {e}'
-                present2, missing2 = media_present(st)
-                if not present2:
-                    ok = False
-                    missing = missing2
+                req_present, req_missing, _present, missing = runtime_presence(st)
+                if req_missing:
                     break
-                if ok:
+                if report.get('ok'):
                     break
                 if attempt < 2:
                     time.sleep(0.4)
+            if req_missing:
+                denied = denied_bits(st, req_missing)
+                verified = False
+            else:
+                denied = denied_bits(st, report.get('missing') or [], report.get('failed') or [])
+                verified = True
             was_denied = not current.get('media_ok')
-            _push_maps(st, ok, recover_ssh=bool(ok and was_denied))
+            _push_maps(st, denied, recover_ssh=bool(denied == 0 and was_denied))
             out = {
-                'ok': True, 'media_ok': ok, 'present': present2 and ok,
-                'devices_present': present2,
-                'missing': missing if not present2 else [],
-                'maps': read_maps(), 'verified': True,
-                'ssh_recovered': bool(ok and was_denied),
+                'ok': True, 'media_ok': denied == 0, 'present': not req_missing and denied == 0,
+                'devices_present': not req_missing,
+                'missing': _paths(missing) if req_missing else missing_paths,
+                'runtime_missing': _paths(req_missing),
+                'denied_bits': denied,
+                'maps': read_maps(), 'verified': verified,
+                'ssh_recovered': bool(denied == 0 and was_denied),
             }
             if verify_error:
                 out['verify_error'] = verify_error
             return out
     except TimeoutError:
-        # Another verify is in progress. Presence is complete, so do not block.
+        # Another verify is in progress. Runtime media are present, so do not block.
         return {
             'ok': True, 'media_ok': current.get('media_ok'),
-            'present': True, 'missing': [], 'busy': True, 'maps': current,
+            'present': True, 'missing': missing_paths, 'busy': True, 'maps': current,
         }
 
 
@@ -556,8 +860,8 @@ def watch_loop(poll: float = 0.5) -> None:
     last_sig = None
 
     def snapshot_sig(st: dict) -> tuple:
-        present, missing = media_present(st)
-        return (present, tuple(missing))
+        _req_present, req_missing, _present, _missing = runtime_presence(st)
+        return (not req_missing, tuple(_paths(req_missing)))
 
     def tick(reason: str) -> dict:
         st = load_state()

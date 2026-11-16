@@ -42,13 +42,14 @@ class HookPolicyTests(unittest.TestCase):
             media_ssh = tmp / 'ssh.img'
             for p in (media_root, media_admin, media_ssh):
                 subprocess.check_call(['truncate', '-s', '256M', str(p)])
-            d_root = _losetup(media_root)
-            d_admin = _losetup(media_admin)
-            d_ssh = _losetup(media_ssh)
+            loop_devs = []
             env = os.environ.copy()
             env['KER_PREFIX'] = str(tmp)
             env['PYTHONPATH'] = str(ROOT / 'python')
             try:
+                for img in (media_root, media_admin, media_ssh):
+                    loop_devs.append(_losetup(img))
+                d_root, d_admin, d_ssh = loop_devs
                 media = [
                     {'path': d_root, 'kind': 'disk',
                      'keys': ['root.pem', 'boot.pem', 'write.pem'], 'role': 'root'},
@@ -139,7 +140,7 @@ class HookPolicyTests(unittest.TestCase):
                 self.assertTrue(d['allow'] and not d['block'])
                 self.assertEqual(d['reason'], 'PERMISSION_NOT_SELECTED')
             finally:
-                for d in (d_root, d_admin, d_ssh):
+                for d in loop_devs:
                     subprocess.run(['losetup', '-d', d], capture_output=True)
 
     def test_mount_failure_is_recorded(self):

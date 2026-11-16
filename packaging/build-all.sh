@@ -30,4 +30,9 @@ for a in $ARCHES; do
   done
 done
 echo "Built $ok packages, $fail failures. Artifacts in $ROOT/dist"
+if [ "$fail" -eq 0 ]; then
+  # Signs only when KER_RELEASE_GNUPGHOME holds the offline private key.
+  # A build without that key stays unsigned on purpose.
+  bash "$ROOT/packaging/sign-dist.sh" || true
+fi
 [ "$fail" -eq 0 ]
