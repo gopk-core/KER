@@ -296,6 +296,69 @@ def authorize(permission: str, st: dict | None = None, devices: list[str] | None
     return base
 
 
+def verified_custom_keys(st: dict | None = None) -> set[str]:
+    """Keys on media that are present and verified. Any verify failure grants none."""
+    from ker.enforce import presence_sets
+    from ker.testmode import verify_each
+    st = st or load_state()
+    present, missing = presence_sets(st)
+    inactive: set[str] = set()
+    for medium in missing:
+        if isinstance(medium, dict):
+            inactive.update(medium.get('keys') or [])
+    if not present:
+        return set()
+    try:
+        report = verify_each(st, devices=present)
+    except Exception:
+        return set()
+    failed_paths = set()
+    for medium in list(report.get('failed') or []) + list(report.get('missing') or []):
+        if isinstance(medium, dict) and medium.get('path'):
+            failed_paths.add(medium.get('path'))
+    active: set[str] = set()
+    for medium in present:
+        if not isinstance(medium, dict) or medium.get('path') in failed_paths:
+            continue
+        if not report.get('ok'):
+            passed = False
+            for row in report.get('results') or []:
+                if isinstance(row, dict) and row.get('ok') and row.get('path') == medium.get('path'):
+                    passed = True
+            if not passed:
+                continue
+        active.update(medium.get('keys') or [])
+    return active - inactive
+
+
+def merge_login_constraint(decision: dict, user: str, st: dict | None = None,
+                           active_keys: set[str] | None = None) -> dict:
+    """Apply custom login rules to an SSH hook decision.
+
+    A rule for one user does not authorize anyone else. When enforcement is
+    on and a rule names this user but its medium is not active, the login is
+    denied. Users that no login rule names are left to the ssh.pem decision.
+    Test mode records the result and does not block.
+    """
+    from ker.custom import custom_authorizes, governed_subject
+    st = st or load_state()
+    out = dict(decision)
+    if not governed_subject(st, kind='login', user=user or ''):
+        out['custom_login'] = 'not_governed'
+        return out
+    if active_keys is None:
+        keys = verified_custom_keys(st)
+    else:
+        keys = set(active_keys)
+    allowed = custom_authorizes(st, kind='login', user=user or '', active_keys=keys)
+    out['custom_login'] = 'allow' if allowed else 'deny'
+    if enforcement_enabled(st) and not allowed:
+        out['allow'] = False
+        out['block'] = True
+        out['reason'] = 'CUSTOM_LOGIN_DENIED'
+    return out
+
+
 def log_decision(decision: dict, *, tag: str = 'ker-hook') -> None:
     msg = (
         f"{tag}: permission={decision.get('permission')} mode={decision.get('mode')} "

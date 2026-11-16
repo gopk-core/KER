@@ -73,6 +73,11 @@ In enforcement, a missing or invalid `ssh.pem` medium denies both key and
 password SSH. In test mode the same condition is logged and the login is
 allowed.
 
+A custom login rule is applied by the same PAM helper, on top of `ssh.pem`.
+The rule authorizes only the users it names. Another user is not covered by
+that rule. If the named user's medium is missing while enforcement is on,
+that user is denied. Test mode still does not block.
+
 The installer refuses to modify sshd or PAM on a host where
 `ker-guard.service` is active, so this production machine's real sshd is not
 weakened by a package build.

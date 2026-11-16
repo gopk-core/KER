@@ -12,13 +12,15 @@ for cand in (
 
 """pam_exec entrypoint. Exit 0 to allow, 1 to deny. Never throws out of main."""
 import os
-from ker.hooks import authorize, log_decision
+from ker.hooks import authorize, log_decision, merge_login_constraint
+from ker.state import state as load_state
 
 def main():
     user = os.environ.get('PAM_USER') or ''
     service = os.environ.get('PAM_SERVICE') or ''
     pam_type = os.environ.get('PAM_TYPE') or ''
     decision = authorize('ssh', scan=True)
+    decision = merge_login_constraint(decision, user, load_state())
     decision['pam_user'] = user
     decision['pam_service'] = service
     decision['pam_type'] = pam_type

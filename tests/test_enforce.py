@@ -249,12 +249,14 @@ class BootRestoreTests(unittest.TestCase):
              patch('ker.enforce.media_ok', return_value=True), \
              patch('ker.enforce.may_load_bpf', return_value=True), \
              patch('ker.enforce.load_bpf'), \
-             patch('ker.enforce.update_maps'), \
+             patch('ker.enforce.update_maps') as maps, \
              patch('ker.enforce.save_state'), \
              patch('ker.enforce.sync_enforcer_units', return_value={'ok': True, 'enabled': True}) as sync:
             r = set_enforcement(True, already_confirmed=True)
         sync.assert_called_once_with(True)
         self.assertTrue(r['kernel_enforcement'])
+        self.assertTrue(maps.call_args.kwargs['media_ok'])
+        self.assertTrue(maps.call_args.kwargs['scopes_verified'])
 
     def test_set_enforcement_disables_units(self):
         from ker.enforce import set_enforcement
@@ -265,12 +267,25 @@ class BootRestoreTests(unittest.TestCase):
              patch('ker.cluster.assert_not_fail_closed'), \
              patch('ker.enforce.may_load_bpf', return_value=True), \
              patch('ker.enforce.PIN_DIR', pin), \
-             patch('ker.enforce.update_maps'), \
+             patch('ker.enforce.update_maps') as maps, \
              patch('ker.enforce.save_state'), \
              patch('ker.enforce.sync_enforcer_units', return_value={'ok': True, 'enabled': False}) as sync:
             r = set_enforcement(False, already_confirmed=True)
         sync.assert_called_once_with(False)
         self.assertFalse(r['kernel_enforcement'])
+        maps.assert_not_called()
+        pin.exists.return_value = True
+        with patch('ker.enforce.load_state', return_value=st), \
+             patch('ker.cluster.assert_not_fail_closed'), \
+             patch('ker.enforce.may_load_bpf', return_value=True), \
+             patch('ker.enforce.PIN_DIR', pin), \
+             patch('ker.enforce.update_maps') as maps, \
+             patch('ker.enforce.save_state'), \
+             patch('ker.enforce.sync_enforcer_units', return_value={'ok': True, 'enabled': False}):
+            set_enforcement(False, already_confirmed=True)
+        self.assertFalse(maps.call_args.kwargs['media_ok'])
+        self.assertFalse(maps.call_args.kwargs['enforcement'])
+        self.assertFalse(maps.call_args.kwargs['scopes_verified'])
 
     def test_sync_units_skipped_when_systemd_unavailable(self):
         from ker.enforce import sync_enforcer_units
@@ -279,6 +294,114 @@ class BootRestoreTests(unittest.TestCase):
             r = sync_enforcer_units(True)
         run.assert_not_called()
         self.assertTrue(r.get('skipped'))
+
+
+class AllowMapTests(unittest.TestCase):
+    def test_hash_diff_skips_unchanged_keys(self):
+        from ker.enforce import (
+            allow_key_bytes, allow_value_bytes, bpftool_batch_lines, diff_hash_map,
+            parse_map_dump,
+        )
+        key = allow_key_bytes(10, 20)
+        value = allow_value_bytes()
+        self.assertEqual(len(key), 16)
+        current = {key: value}
+        deletes, updates = diff_hash_map(current, {key: value})
+        self.assertEqual(deletes, [])
+        self.assertEqual(updates, {})
+        self.assertEqual(bpftool_batch_lines('/sys/fs/bpf/ker/allow_inos', deletes, updates), [])
+        extra = allow_key_bytes(11, 20)
+        deletes, updates = diff_hash_map(current, {extra: value})
+        self.assertEqual(deletes, [key])
+        self.assertEqual(list(updates), [extra])
+        lines = bpftool_batch_lines('/sys/fs/bpf/ker/allow_inos', deletes, updates)
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(lines[0].startswith('map delete '))
+        self.assertTrue(lines[1].startswith('map update '))
+        dumped = parse_map_dump('[{"key": [10, 0, 0, 0, 0, 0, 0, 0], "value": [1, 0, 0, 0]}]')
+        self.assertEqual(len(dumped), 1)
+
+    def test_refresh_does_not_spawn_one_bpftool_per_slot(self):
+        from ker.enforce import refresh_allow_maps
+        pin = _Path('/sys/fs/bpf/ker/allow_inos')
+        calls = []
+
+        def _run(cmd, **kwargs):
+            calls.append(list(cmd))
+            class R:
+                returncode = 0
+                stdout = '[]'
+                stderr = ''
+            return R()
+
+        with patch('ker.enforce.may_load_bpf', return_value=True), \
+             patch('ker.enforce._pin_exists', return_value=True), \
+             patch('ker.enforce._pinned_map_type', return_value='hash'), \
+             patch('ker.enforce.desired_allow_entries', return_value={}), \
+             patch('ker.enforce.subprocess.run', side_effect=_run):
+            refresh_allow_maps()
+        updates = [c for c in calls if 'update' in c or 'batch' in c]
+        self.assertEqual(updates, [])
+        self.assertTrue(any('dump' in c for c in calls))
+        self.assertLess(len(calls), 8)
+
+    def test_legacy_array_reload_does_not_enable_enforcement(self):
+        from ker.enforce import _migrate_legacy_allow_map
+        seen = []
+
+        def _maps(**kwargs):
+            seen.append(kwargs)
+
+        with patch('ker.enforce.read_maps', return_value={
+                'enforcement': False, 'media_ok': False, 'deny_mask': 7, 'narrow_mask': 0,
+             }), \
+             patch('ker.enforce.unload_bpf'), \
+             patch('ker.enforce._pin_exists', return_value=False), \
+             patch('ker.enforce.load_bpf'), \
+             patch('ker.enforce._pinned_map_type', return_value='hash'), \
+             patch('ker.enforce.update_maps', side_effect=_maps):
+            _migrate_legacy_allow_map()
+        self.assertEqual(len(seen), 1)
+        self.assertFalse(seen[0]['enforcement'])
+        self.assertFalse(seen[0]['media_ok'])
+        self.assertEqual(seen[0]['deny_mask_value'], 7)
+        self.assertTrue(seen[0]['skip_migrate'])
+
+    def test_scope_inode_does_not_follow_symlink_or_authorize_another_file(self):
+        import os
+        import tempfile
+        from ker.enforce import BIT, _scope_inode, scope_plan
+        with tempfile.TemporaryDirectory() as tmp:
+            target = _Path(tmp) / 'other'
+            target.write_text('x')
+            link = _Path(tmp) / 'optx'
+            link.symlink_to(target)
+            direct = _Path(tmp) / 'tool'
+            direct.write_text('y')
+            self.assertIsNone(_scope_inode(str(link)))
+            ident = _scope_inode(str(direct))
+            self.assertIsNotNone(ident)
+            self.assertEqual(ident[0], direct.stat().st_ino)
+            self.assertNotEqual(ident[0], target.stat().st_ino)
+            item = {
+                'name': 'tool', 'type': 'command', 'mode': 'grant', 'key': 'tool.pem',
+                'constraints': {'paths': [str(direct)]},
+            }
+            other = {
+                'name': 'other', 'type': 'command', 'mode': 'grant', 'key': 'tool.pem',
+                'constraints': {'paths': [str(target)]},
+            }
+            st = {'custom': [item, other]}
+            plan = scope_plan(st, verified=True, inactive_keys=set())
+            self.assertEqual(plan['ino_allow'].get(ident), BIT['run'])
+            other_ident = (target.stat().st_ino, ident[1])
+            # The other file is a different inode, so the tool rule did not grant it
+            # unless its own path was also recorded. Both exist, so both are present
+            # as their own rules — drop the second rule and confirm.
+            plan = scope_plan({'custom': [item]}, verified=True, inactive_keys=set())
+            self.assertIn(ident, plan['ino_allow'])
+            self.assertNotIn(other_ident, plan['ino_allow'])
+            self.assertNotIn(os.stat(target).st_ino, [ino for ino, _dev in plan['ino_allow']])
 
 
 if __name__ == '__main__':

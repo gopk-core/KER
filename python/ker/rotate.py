@@ -106,25 +106,36 @@ def _require_proof(st: dict, present: list[dict], missing: list[dict]) -> None:
     root_missing = [m for m in missing if medium_is_root(m)]
     if root_missing:
         if not admin_present:
-            raise RotateError('lost root medium requires a verified admin medium as proof')
+            raise RotateError(
+                'lost root medium requires a verified admin medium as proof; '
+                'refusing to revoke without a root or admin medium'
+            )
         proof = admin_present
     else:
         if not root_present:
-            raise RotateError('rotation requires the root medium, or the admin medium when root is lost')
+            raise RotateError(
+                'rotation requires the root medium, or the admin medium when root is lost; '
+                'refusing to revoke without a root or admin medium'
+            )
         proof = root_present
     report = verify_each(st, devices=proof, proof_only=True)
     if not report.get('ok'):
         raise RotateError('remaining root or admin medium failed verification')
 
 
-def _apply_kernel_mode(st: dict, enabled: bool) -> None:
+def _apply_kernel_mode(st: dict, enabled: bool, *, verified: bool = False) -> None:
     """Make loaded BPF maps and enforcer units match enabled.
 
-    Does not load BPF. If a pin is already present, its enforcement flag is
-    updated so a watcher that has stopped cannot leave enforcement=1 behind.
+    Does not load BPF. Enabling enforcement never sets media_ok until the
+    caller has confirmed the new media (verified=True). Until then the map
+    stays fail-closed: the selected policy bits are in deny_mask and
+    media_ok is 0, including when enforcement itself is off, so a later
+    enforcement=1 cannot observe an open mask.
     """
     try:
-        from ker.enforce import EnforceError, PIN_DIR, may_load_bpf, sync_enforcer_units, update_maps
+        from ker.enforce import (
+            EnforceError, PIN_DIR, may_load_bpf, policy_bits, sync_enforcer_units, update_maps,
+        )
     except Exception:
         return
     try:
@@ -134,10 +145,13 @@ def _apply_kernel_mode(st: dict, enabled: bool) -> None:
     try:
         if not may_load_bpf() or not PIN_DIR.exists():
             return
+        open_maps = bool(enabled) and bool(verified)
         update_maps(
             enforcement=bool(enabled),
-            media_ok=True,
+            media_ok=open_maps,
             permissions=st.get('permissions') or [],
+            deny_mask_value=policy_bits(st),
+            scopes_verified=open_maps,
         )
     except EnforceError:
         pass
@@ -183,11 +197,14 @@ def rotate(*, assume_replug: bool = False, lang: str = 'zh-CN',
             previous_enforce=previous_enforce,
             assume_replug=assume_replug, lang=lang,
         )
-    except Exception:
+    except BaseException:
+        # SystemExit from a failed replug is not an Exception. Either way the
+        # maps must not stay open: enforcement may return, but only fail-closed
+        # until presence and signatures are confirmed again.
         st['kernel_enforcement'] = previous_enforce
         st['mode'] = 'enforce' if previous_enforce else (st.get('mode') or 'test')
         try:
-            _apply_kernel_mode(st, previous_enforce)
+            _apply_kernel_mode(st, previous_enforce, verified=False)
         except Exception:
             pass
         raise
@@ -316,12 +333,13 @@ def _rotate_body(st: dict, planned: list[dict], selected: list, custom: list, *,
     st['iso'] = iso_paths
     st['vault'] = vault
     st['key_generation'] = new_gen
-    # Restore the mode that was in effect. The rewrite window above really
-    # did clear enforcement; this puts maps and units back in step with state.
+    # Restore the mode that was in effect, but do not open permissions until
+    # the rewritten media have been verified. A failed replug leaves this
+    # fail-closed mask in place.
     st['kernel_enforcement'] = previous_enforce
     st['mode'] = 'enforce' if previous_enforce else 'test'
     save_state(st)
-    _apply_kernel_mode(st, previous_enforce)
+    _apply_kernel_mode(st, previous_enforce, verified=False)
 
     queue_command(None, {
         'type': 'cutover',
@@ -348,6 +366,8 @@ def _rotate_body(st: dict, planned: list[dict], selected: list, custom: list, *,
     save_state(st)
 
     run_replug_tests(lang, st, assume=assume_replug)
+    if previous_enforce:
+        _apply_kernel_mode(st, True, verified=True)
     try:
         from ker.hooks import refresh_boot_initramfs
         refresh_boot_initramfs()

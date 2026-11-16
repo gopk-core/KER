@@ -63,6 +63,10 @@ def main(argv: list[str] | None = None) -> int:
     p_enf.add_argument('--watch', action='store_true',
                        help='run the persistent media watcher (systemd ker-enforcer.service)')
     sub.add_parser('console')
+    sub.add_parser(
+        'revoke-medium',
+        help='revoke or replace a missing medium; proof is the remaining root medium, or admin if root is lost',
+    )
     p_test = sub.add_parser('test-media')
     p_test.add_argument('--assume-replug', action='store_true')
 
@@ -83,9 +87,17 @@ def main(argv: list[str] | None = None) -> int:
         idx = argv.index('console')
         args = parser.parse_args(argv[:idx+1])
         args._console_rest = argv[idx+1:]
+        args._revoke_rest = []
+    elif argv and 'revoke-medium' in argv:
+        # Flags belong to the console parser so root-or-admin proof stays in one place.
+        idx = argv.index('revoke-medium')
+        args = parser.parse_args(argv[:idx+1])
+        args._console_rest = []
+        args._revoke_rest = argv[idx+1:]
     else:
         args = parser.parse_args(argv)
         args._console_rest = []
+        args._revoke_rest = []
     lang = args.language or 'zh-CN'
 
     if args.cmd is None:
@@ -157,6 +169,11 @@ def main(argv: list[str] | None = None) -> int:
         # We need the original tokens after the console subcommand.
         rest = _console_argv(argv)
         return console_run(lang, rest)
+    if args.cmd == 'revoke-medium':
+        # Thin alias of `ker console revoke-medium`. The console path does
+        # not ask for an admin disk for this action; rotate() accepts a
+        # verified root medium, or the admin medium when root is missing.
+        return console_run(lang, ['revoke-medium', *list(getattr(args, '_revoke_rest', None) or [])])
 
     if args.cmd == 'upgrade':
         return _upgrade(lang, args)
