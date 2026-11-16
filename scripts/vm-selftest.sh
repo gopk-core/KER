@@ -6,12 +6,15 @@ if [ "$$" -ne 1 ]; then
   echo "vm-selftest: refusing to run (pid $$ is not 1). It must not install packages or load BPF on the build host." >&2
   exit 1
 fi
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+# switch_root leaves /proc unmounted; mount it before reading the kernel command line.
+mkdir -p /proc
+mount -t proc proc /proc 2>/dev/null || true
 if ! grep -qw 'init=/usr/lib/ker/vm-selftest.sh' /proc/cmdline 2>/dev/null \
    && ! grep -qw 'ker.selftest=phase2' /proc/cmdline 2>/dev/null; then
   echo "vm-selftest: refusing to run without the guest kernel command line." >&2
   exit 1
 fi
-export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PYTHONPATH="/usr/lib/ker${PYTHONPATH:+:$PYTHONPATH}"
 export KER_IN_VM=1
 export LANG=C
@@ -70,10 +73,15 @@ fi
 export RESULT="$RESULT_MNT/result.json"
 export LOG="$RESULT_MNT/selftest.log"
 touch "$LOG"
+# Do not use process substitution as PID 1. If tee exits after BPF is
+# armed, the next write can kill init and leave an empty result log.
 if [ -w /dev/console ]; then
-  exec > >(tee -a "$LOG" >/dev/console) 2>&1
-else
-  exec >>"$LOG" 2>&1
+  exec >/dev/console 2>&1
+fi
+# Keep a file copy by appending; this is best-effort and must not replace
+# stdout, because a later EACCES on the result disk must not kill init.
+if [ -n "$LOG" ]; then
+  : >>"$LOG"
 fi
 echo "KER VM selftest starting $(date -Is) phase=$PHASE"
 echo "kernel=$(uname -r) virt=$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)"
@@ -90,6 +98,8 @@ _finish() {
 
 fail() {
   echo "FAIL: $*"
+  echo "FAIL: $*" >/dev/kmsg 2>/dev/null || true
+  [ -n "$LOG" ] && echo "FAIL: $*" >>"$LOG" 2>/dev/null || true
   python3 - "$RESULT" "$*" "$PHASE" << 'PY'
 import json, sys, time
 path, err, phase = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -371,33 +381,91 @@ PY
 unset KER_PREFIX
 
 ker --language zh-CN enforce --set enforce --yes || fail "enforce enable failed"
+echo "running ker-probe while media present"
+echo "running ker-probe while media present" >/dev/kmsg 2>/dev/null || true
 if ! /usr/lib/ker/ker-probe; then
+  rc=$?
+  echo "ker-probe rc=$rc (denied or crashed while media present)"
+  echo "ker-probe rc=$rc" >/dev/kmsg 2>/dev/null || true
   fail "ker-probe denied while media present"
 fi
-# cat is not an allowlisted path. ker-probe is an exact helper path, so it
-# must keep working when other programs are denied.
-python3 - << 'PY' || fail "media_ok flip / probe failed"
-import shutil, subprocess, sys
-from ker.enforce import update_maps
+echo "ker-probe ok while media present"
+# Use the allowlisted interpreter so this script can still print and call
+# bpftool after media_ok is flipped to 0. System python3 is not allowlisted.
+echo "starting media_ok flip test with ker-python"
+if ! /usr/lib/ker/ker-python -u - << 'ENDFLIP'
+import os, shutil, subprocess, sys
+from ker.enforce import (
+    PIN_DIR, allow_key_bytes, executable_identity, update_maps,
+)
 from ker.state import state
+
+def log(msg):
+    print(msg, flush=True)
+    try:
+        os.write(os.open("/dev/kmsg", os.O_WRONLY | os.O_CLOEXEC), (msg + "\n").encode())
+    except OSError:
+        pass
+
+log("ker-python flip test started")
 st = state()
 perms = st.get("permissions") or []
+for path in ("/usr/lib/ker/ker-probe", "/usr/sbin/bpftool", "/usr/lib/ker/ker-python"):
+    ident = executable_identity(path)
+    log("identity %s %s" % (path, ident))
+    if ident:
+        log("  key %s" % allow_key_bytes(*ident).hex())
+
+for name in ("cfg_map", "cfg", "allow_inos"):
+    pin = PIN_DIR / name
+    if not pin.exists():
+        log("missing pin %s" % pin)
+        continue
+    r = subprocess.run(["bpftool", "map", "dump", "pinned", str(pin)], capture_output=True, text=True)
+    log("dump %s rc=%s" % (name, r.returncode))
+    out = (r.stdout or "") + (r.stderr or "")
+    log(out[:4000] if out else "(empty)")
+
+def run_denied_ok(argv):
+    """Python 3.13 posix_spawn raises PermissionError on LSM EACCES."""
+    try:
+        r = subprocess.run(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return r.returncode
+    except PermissionError as e:
+        log("spawn denied %s: %s" % (argv[0], e))
+        return 13
+
 cat = shutil.which("cat") or "/bin/cat"
-update_maps(enforcement=True, media_ok=False, permissions=perms)
-r = subprocess.run([cat, "/etc/hostname"], stdout=subprocess.DEVNULL)
-print("cat rc with media_ok=0:", r.returncode)
-if r.returncode == 0:
-    sys.exit("cat unexpectedly allowed")
-probe = subprocess.run(["/usr/lib/ker/ker-probe"])
-print("ker-probe rc with media_ok=0:", probe.returncode)
-if probe.returncode != 0:
-    sys.exit("allowlisted ker-probe was denied")
-update_maps(enforcement=True, media_ok=True, permissions=perms)
-r = subprocess.run([cat, "/etc/hostname"], stdout=subprocess.DEVNULL)
-if r.returncode != 0:
-    sys.exit("cat denied after restore")
-print("enforcement probe ok")
-PY
+log("flipping media_ok to 0")
+try:
+    update_maps(enforcement=True, media_ok=False, permissions=perms)
+    log("media_ok now 0")
+    rc = run_denied_ok([cat, "/etc/hostname"])
+    log("cat rc with media_ok=0: %s" % rc)
+    if rc == 0:
+        raise SystemExit("cat unexpectedly allowed")
+    rc = run_denied_ok(["/usr/lib/ker/ker-probe"])
+    log("ker-probe rc with media_ok=0: %s" % rc)
+    if rc != 0:
+        raise SystemExit("allowlisted ker-probe was denied")
+    update_maps(enforcement=True, media_ok=True, permissions=perms)
+    log("media_ok restored")
+    rc = run_denied_ok([cat, "/etc/hostname"])
+    if rc != 0:
+        raise SystemExit("cat denied after restore")
+    log("enforcement probe ok")
+finally:
+    # Restore so PID 1 (unallowlisted bash) can write and exec the rest.
+    try:
+        update_maps(enforcement=True, media_ok=True, permissions=perms)
+    except Exception as e:
+        log("restore media_ok failed: %s" % e)
+ENDFLIP
+then
+  echo "media_ok flip test rc=$?"
+  echo "media_ok flip test failed" >/dev/kmsg 2>/dev/null || true
+  fail "media_ok flip / probe failed"
+fi
 ker --language zh-CN enforce --set test --yes || fail "enforce disable failed"
 
 ker --language zh-CN console --admin-dev /dev/vdc rotate --assume-replug || fail "rotate failed"

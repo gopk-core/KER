@@ -14,6 +14,7 @@
 
 - **不要**在已经运行另一套内核防护（例如本机上的 `ker-guard`）的生产主机上安装 KER 软件包，也不要在该主机上加载新的 BPF，或重建其 initramfs。
 - 内核拦截默认关闭，且**不会**因安装或升级软件包而自动打开。只有在介质校验通过后，由管理员显式执行 `ker enforce --set enforce --yes` 才会启用。裸机默认拒绝加载 BPF；若确有需要，必须显式设置 `KER_ALLOW_HOST_BPF=1`。
+- 强制模式要求 **PID 1 是可执行文件白名单里的具体 inode**。systemd 发行版满足；busybox init（Alpine 等）、openrc、runit、s6 不满足，在这些系统上 `ker enforce --set enforce` 会直接拒绝并说明原因，不会加载 BPF。请留在测试模式。
 - 即使没有 Secure Boot 或内核 lockdown，KER 也不能阻止已经拿到 root 的人替换内核或引导程序。它提供的是带签名介质的授权与可选的 LSM 拦截，不是固件级信任根。
 - `boot.pem` 的早期启动挂钩在强制模式下失败即关闭（fail-closed）：缺介质或校验失败会拒绝进入真实根文件系统。不要削弱这一策略。
 

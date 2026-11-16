@@ -28,9 +28,19 @@ die() { echo "vm-test: $*" >&2; exit 1; }
 # Build the current amd64 package only (do not dpkg -i on the host).
 make -C "$ROOT" bpf probe
 bash "$ROOT/packaging/build-deb.sh" amd64
-DEB=$(ls -1t "$DIST"/ker_*_amd64.deb | head -1)
-[ -n "$DEB" ] || die "amd64 deb not built"
+# Use the tree's current version only. Never pick a leftover ker_*_amd64.deb
+# just because its mtime is newest (that is how the 0.4.0 guest result lingered).
+VER=$(sed -n "s/^__version__ = ['\"]\\([^'\"]*\\)['\"].*/\\1/p" "$ROOT/python/ker/__init__.py")
+[ -n "$VER" ] || die "could not read __version__"
+DEB="$DIST/ker_${VER}_amd64.deb"
+[ -f "$DEB" ] || die "amd64 deb not built: $DEB"
 echo "using $DEB"
+
+# Drop leftover guest results so a previous version cannot look like this run.
+mkdir -p "$DIST/vm-results"
+rm -f "$DIST/vm-results/result.json" "$DIST/vm-results/phase1.json" \
+  "$DIST/vm-results/boot-hook.json" "$DIST/vm-results/selftest.log" \
+  "$DIST/vm-results/boot-check.err"
 
 # Custom initrd with virtio_blk + ext4, because the host initrd may not
 # have virtio (this machine is bare metal).
@@ -48,40 +58,54 @@ CONF
   printf '%s\n' virtio_blk crc16 crc32c mbcache jbd2 ext4 > "$conf/modules"
   mkdir -p "$conf/conf.d"
   echo RESUME=none > "$conf/conf.d/resume"
-  if mkinitramfs -d "$conf" -o "$INITRD" "$KVER"; then
-    echo "initrd built with mkinitramfs: $INITRD"
-    return 0
-  fi
-  echo "mkinitramfs failed; assembling a busybox initrd" >&2
+  # Bare-metal host initrd is not used. Always assemble a busybox initrd
+  # that explicitly loads virtio_blk. mkinitramfs may exit 0 with a broken
+  # scripts tree and leave the module packed but unloaded (/dev/vda missing).
+  echo "assembling a busybox initrd with virtio_blk"
   local dest="$work/root"
   mkdir -p "$dest"/{bin,sbin,dev,proc,sys,newroot,lib/modules/"$KVER"}
   cp /bin/busybox "$dest/bin/busybox"
-  "$dest/bin/busybox" --install -s "$dest/bin"
-  # copy needed modules + deps via modprobe --show-depends
+  # Do not --install at build time: busybox would emit absolute symlinks
+  # into the staging path that are broken inside the guest. /init runs it.
+  # copy needed modules + deps via modprobe --show-depends.
+  # Host modules are compressed; busybox insmod cannot load .ko.xz, so decompress.
   local m ko
-  for m in virtio virtio_ring virtio_pci virtio_blk crc32c mbcache jbd2 ext4; do
+  for m in virtio virtio_ring virtio_pci virtio_blk crc16 crc32c crc32c_generic crc32c-intel libcrc32c mbcache jbd2 ext4; do
     while read -r _ ko; do
       [ -f "${ko:-}" ] || continue
       mkdir -p "$dest/$(dirname "${ko#/}")"
-      cp -a "$ko" "$dest$ko"
+      case "$ko" in
+        *.ko.xz) xz -dc "$ko" > "$dest${ko%.xz}" ;;
+        *.ko.zst) zstd -dc "$ko" > "$dest${ko%.zst}" ;;
+        *.ko.gz) gzip -dc "$ko" > "$dest${ko%.gz}" ;;
+        *) cp -a "$ko" "$dest$ko" ;;
+      esac
     done < <(modprobe --set-version "$KVER" --show-depends "$m" 2>/dev/null | awk '/^insmod /{print $1,$2}')
   done
   cp -a "/lib/modules/$KVER/modules.dep" "$dest/lib/modules/$KVER/" 2>/dev/null || true
+  cp -a "/lib/modules/$KVER/modules.alias" "$dest/lib/modules/$KVER/" 2>/dev/null || true
+  cp -a "/lib/modules/$KVER/modules.builtin" "$dest/lib/modules/$KVER/" 2>/dev/null || true
   cat > "$dest/init" << 'INIT'
 #!/bin/busybox sh
 /bin/busybox --install -s /bin
-mount -t proc proc /proc
-mount -t sysfs sys /sys
-mount -t devtmpfs dev /dev 2>/dev/null || mount -t tmpfs dev /dev
-for m in virtio virtio_ring virtio_pci virtio_blk crc32c mbcache jbd2 ext4; do
-  modprobe "$m" 2>/dev/null || insmod $(find /lib/modules -name "$m.ko*" | head -1) 2>/dev/null || true
+export PATH=/bin:/sbin
+bb() { /bin/busybox "$@"; }
+bb mount -t proc proc /proc
+bb mount -t sysfs sys /sys
+bb mount -t devtmpfs dev /dev 2>/dev/null || bb mount -t tmpfs dev /dev
+for m in virtio virtio_ring virtio_pci virtio_blk crc16 crc32c crc32c_generic crc32c-intel libcrc32c mbcache jbd2 ext4; do
+  bb modprobe "$m" 2>/dev/null || bb insmod $(bb find /lib/modules -name "$m.ko*" | bb head -1) 2>/dev/null || true
 done
 for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
   [ -b /dev/vda ] && break
-  sleep 0.25
+  bb sleep 0.25
 done
-mount -o rw /dev/vda /newroot || { echo "mount root failed"; exec sh; }
-exec switch_root /newroot /usr/lib/ker/vm-selftest.sh
+bb mkdir -p /newroot
+# libcrc32c must be present before ext4 mount; try again in case first load raced.
+bb insmod $(bb find /lib/modules -name 'crc32c_generic.ko*' | bb head -1) 2>/dev/null || true
+bb insmod $(bb find /lib/modules -name 'libcrc32c.ko*' | bb head -1) 2>/dev/null || true
+bb mount -o rw /dev/vda /newroot || { echo "mount root failed"; exec /bin/busybox sh; }
+exec /bin/busybox switch_root /newroot /usr/lib/ker/vm-selftest.sh
 INIT
   chmod 755 "$dest/init"
   ( cd "$dest" && find . | cpio -o -H newc ) | gzip -c > "$INITRD"
@@ -114,6 +138,24 @@ if ! chroot "$ROOTFS" sh -c "command -v sshd >/dev/null"; then
     openssh-server openssh-client || die "failed to install openssh into guest rootfs"
   umount -l "$ROOTFS/dev/pts" "$ROOTFS/dev" "$ROOTFS/proc" 2>/dev/null || true
   rm -f "$ROOTFS/usr/sbin/policy-rc.d"
+fi
+
+# Debootstrap left systemd without systemd-sysv, so /sbin/init is missing and
+# the init pre-flight refuses to arm. Install the symlink package in the guest
+# only; policy-rc.d keeps any maintainer scripts from starting services.
+if ! chroot "$ROOTFS" sh -c "test -e /sbin/init -o -e /usr/sbin/init"; then
+  echo "installing systemd-sysv into the guest rootfs (for /sbin/init)"
+  printf "%s\n" "#!/bin/sh" "exit 101" > "$ROOTFS/usr/sbin/policy-rc.d"
+  chmod 755 "$ROOTFS/usr/sbin/policy-rc.d"
+  mount -t proc proc "$ROOTFS/proc"
+  mount --bind /dev "$ROOTFS/dev"
+  mount -t devpts devpts "$ROOTFS/dev/pts" 2>/dev/null || true
+  DEBIAN_FRONTEND=noninteractive chroot "$ROOTFS" apt-get install -y --no-install-recommends \
+    systemd-sysv || die "failed to install systemd-sysv into guest rootfs"
+  umount -l "$ROOTFS/dev/pts" "$ROOTFS/dev" "$ROOTFS/proc" 2>/dev/null || true
+  rm -f "$ROOTFS/usr/sbin/policy-rc.d"
+  chroot "$ROOTFS" sh -c "test -e /sbin/init -o -e /usr/sbin/init" \
+    || die "guest still has no /sbin/init after installing systemd-sysv"
 fi
 
 # Drop any leftover chroot mounts before we copy the tree.

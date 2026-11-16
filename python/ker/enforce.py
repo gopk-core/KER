@@ -185,6 +185,48 @@ def executable_identity(path: str, allowed: tuple[str, ...] | None = None) -> tu
     return int(st.st_ino), kernel_dev(st.st_dev)
 
 
+def init_blockers() -> list[str]:
+    """Why enforcement would brick this host, or [] when it is safe to arm.
+
+    The LSM hook denies BIT_RUN for any executable whose inode is not in
+    allow_inos, and there is deliberately no comm or basename fallback. PID 1
+    must therefore be an allowlisted concrete file. A busybox init, openrc,
+    runit or s6 host has an init whose realpath is not on the list, and
+    arming enforcement there would refuse to exec init itself.
+
+    This is a pre-flight check, not a bypass: it never widens the allowlist.
+    A host it rejects must stay in test mode or get its init allowlisted in a
+    later package.
+    """
+    reasons: list[str] = []
+    inits = (
+        '/sbin/init', '/usr/sbin/init', '/etc/init',
+        '/bin/init', '/usr/bin/init',
+    )
+    found = [p for p in inits if Path(p).exists()]
+    if not found:
+        reasons.append('no init binary found at /sbin/init or /usr/sbin/init')
+    elif not any(executable_identity(p) is not None for p in found):
+        targets = ', '.join(
+            '%s -> %s' % (p, os.path.realpath(p)) for p in found
+        )
+        reasons.append(
+            'init is not an allowlisted executable (%s); arming enforcement '
+            'would deny exec of PID 1' % targets
+        )
+    return reasons
+
+
+def assert_armable() -> None:
+    """Raise when arming kernel enforcement would lock the host out."""
+    reasons = init_blockers()
+    if reasons:
+        raise EnforceError(
+            'refusing to enable kernel enforcement: ' + '; '.join(reasons)
+            + '. Stay in test mode, or use a package that allows this init.'
+        )
+
+
 def decide_subject(*, enforcement: bool, media_ok: bool, deny_mask_value: int,
                    bit: int, allowed: bool, narrow_mask: int = 0,
                    scope_allow: int = 0, scope_deny: int = 0,
@@ -568,6 +610,8 @@ def load_bpf() -> None:
             'refusing to load BPF LSM on a bare-metal host '
             '(set KER_ALLOW_HOST_BPF=1 only if you intend this)'
         )
+    # Arming denies exec of any non-allowlisted inode, PID 1 included.
+    assert_armable()
     obj = bpf_object()
     PIN_DIR.mkdir(parents=True, exist_ok=True)
     # Load and auto-attach LSM programs; pin maps for later updates.
@@ -1289,6 +1333,10 @@ def _ensure_bpf_if_enforcing(st: dict) -> bool:
         return False
     if not may_load_bpf():
         return False
+    if init_blockers():
+        # A host that was armed under an older package but whose init is not
+        # allowlisted must not be re-armed on boot. Stay off, keep the flag.
+        return False
     try:
         _map_path()
         allow = PIN_DIR / 'allow_inos'
@@ -1768,6 +1816,8 @@ def set_enforcement(enabled: bool, *, confirm: bool = True, already_confirmed: b
                 'this machine is not a VM and host BPF is not allowed; '
                 'enforcement was not enabled'
             )
+        # Fail before touching maps so state.json is not left claiming enforce.
+        assert_armable()
         load_bpf()
         # media_ok() already verified signatures above. The armed mask stays
         # the selected policy bits; it is not cleared.

@@ -14,6 +14,7 @@ Current version: **0.1.0** (first public release; the already published `0.1` co
 
 - **Do not** install a KER package on a production host that already runs another kernel-level guard (for example `ker-guard`). Do not load the new BPF on that host, and do not rebuild its initramfs.
 - Kernel enforcement is off by default and is **never** turned on by installing or upgrading a package. An administrator enables it only after media verifies, with an explicit `ker enforce --set enforce --yes`. Bare-metal hosts refuse to load BPF unless `KER_ALLOW_HOST_BPF=1` is set on purpose.
+- Enforcement requires **PID 1 to be a concrete inode on the executable allowlist**. systemd distributions satisfy this. busybox init (Alpine and similar), openrc, runit, and s6 do not: on those hosts `ker enforce --set enforce` refuses with the reason and does not load BPF. Stay in test mode.
 - Without Secure Boot or kernel lockdown, KER still cannot stop a root user from replacing the kernel or the bootloader. It provides signed-media authorization and optional LSM enforcement, not a firmware root of trust.
 - The `boot.pem` early-boot hook is fail-closed in enforcement mode: missing media or a failed verify refuses to continue to the real root filesystem. Do not weaken this policy.
 

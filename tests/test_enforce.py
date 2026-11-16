@@ -296,6 +296,62 @@ class BootRestoreTests(unittest.TestCase):
         self.assertTrue(r.get('skipped'))
 
 
+class InitGuardTests(unittest.TestCase):
+    """Arming enforcement must not deny exec of PID 1."""
+
+    def test_busybox_init_is_blocked(self):
+        """A busybox /sbin/init must not be treated as an allowlisted init.
+
+        The list names /sbin/init, but executable_identity also requires the
+        realpath to be allowlisted, so init -> busybox is refused. Arming on
+        such a host would deny exec of PID 1.
+        """
+        import os
+        from ker.enforce import executable_identity
+        tmp = tempfile.mkdtemp()
+        busybox = os.path.join(tmp, 'busybox')
+        open(busybox, 'w').write('#!/bin/sh\n')
+        os.chmod(busybox, 0o755)
+        init = os.path.join(tmp, 'init')
+        os.symlink(busybox, init)
+        # Only the init path is allowlisted; its realpath is busybox.
+        self.assertIsNone(
+            executable_identity(init, (init,)),
+            'a symlink whose realpath is not allowlisted must not pass',
+        )
+        # Allowlisting busybox explicitly would make it pass, which is the
+        # fix a later package would ship.
+        self.assertIsNotNone(executable_identity(init, (init, busybox)))
+
+    def test_no_init_found_is_blocked(self):
+        from ker import enforce
+        with patch.object(_Path, 'exists', return_value=False):
+            reasons = enforce.init_blockers()
+        self.assertTrue(reasons)
+        self.assertIn('no init binary', reasons[0])
+
+    def test_systemd_init_passes(self):
+        from ker import enforce
+        with patch.object(enforce, 'executable_identity', return_value=(1, 1)):
+            with patch.object(_Path, 'exists', return_value=True):
+                self.assertEqual(enforce.init_blockers(), [])
+
+    def test_assert_armable_raises_when_blocked(self):
+        from ker import enforce
+        with patch.object(enforce, 'init_blockers', return_value=['busybox init']):
+            with self.assertRaises(enforce.EnforceError):
+                enforce.assert_armable()
+
+    def test_boot_restore_skips_when_init_blocked(self):
+        from ker import enforce
+        st = {'kernel_enforcement': True, 'permissions': ['run'], 'media': []}
+        with patch.object(enforce, 'may_load_bpf', return_value=True), \
+             patch.object(enforce, 'init_blockers', return_value=['busybox init']), \
+             patch.object(enforce, 'load_bpf') as load:
+            self.assertFalse(enforce._ensure_bpf_if_enforcing(st))
+        load.assert_not_called()
+
+
 class AllowMapTests(unittest.TestCase):
     def test_hash_diff_skips_unchanged_keys(self):
         from ker.enforce import (
