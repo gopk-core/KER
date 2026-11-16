@@ -123,3 +123,10 @@ Packages are architecture-specific, for example `ker_0.1.0_amd64.deb`.
 A detached `.sig` is verified with the shipped public release key.
 Unsigned files still require `ker upgrade --trust-package`. See
 `docs/hooks.md` and `docs/packaging.md`.
+
+The executable allow list is a hash of inode and device (`allow_inos`),
+not a fixed 64-slot array. An in-place upgrade from a 0.1 or 0.1.0 install
+that still has the old array pinned reloads the BPF object on the next map
+update and writes back the enforcement flag that was already in effect. That
+reload does not turn enforcement on by itself, and it does not rewrite sealed
+media. `ver_tuple("0.1")` remains `(0, 1, 0)`, the same as `0.1.0`.

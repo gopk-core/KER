@@ -9,8 +9,10 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import stat
 import struct
 import subprocess
+import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -44,7 +46,8 @@ BIT = {
 # ker-python is a copy of the system interpreter (not a hard link) so its
 # inode does not also authorize /usr/bin/python3. The shebang
 # #!/usr/lib/ker/ker-python still runs as comm ker-python.
-# 64 slots match allow_inos in src/bpf/ker.bpf.c.
+# allow_inos is a hash of inode+device, not a 64-slot array. ALLOW_SLOTS is
+# that hash's max_entries and stays well above the concrete path list.
 ALLOWED_EXEC_PATHS = (
     '/usr/lib/systemd/systemd',
     '/lib/systemd/systemd',
@@ -111,7 +114,10 @@ ALLOWED_EXEC_PATHS = (
     '/usr/sbin/shutdown',
 )
 
-ALLOW_SLOTS = 64
+ALLOW_SLOTS = 1024
+SCOPE_INO_SLOTS = 1024
+SCOPE_UID_SLOTS = 256
+SCOPE_PORT_SLOTS = 256
 
 # Names that must never be treated as an allow by themselves.
 FORBIDDEN_COMMS = (
@@ -177,16 +183,33 @@ def executable_identity(path: str, allowed: tuple[str, ...] | None = None) -> tu
     return int(st.st_ino), kernel_dev(st.st_dev)
 
 
+def decide_subject(*, enforcement: bool, media_ok: bool, deny_mask_value: int,
+                   bit: int, allowed: bool, narrow_mask: int = 0,
+                   scope_allow: int = 0, scope_deny: int = 0,
+                   in_scope: bool = False) -> bool:
+    """True when BPF decide_subject would deny this subject.
+
+    A scoped allow clears only its own bits. It does not clear a deny for a
+    different path, user, or port, because that subject is not in_scope.
+    """
+    if allowed or not enforcement:
+        return False
+    blocked = int(narrow_mask) & int(bit)
+    if not media_ok:
+        blocked |= int(deny_mask_value) & int(bit)
+    if in_scope:
+        blocked |= int(scope_deny) & int(bit)
+        blocked &= (~int(scope_allow)) & 0xFFFFFFFF
+    return bool(blocked)
+
+
 def would_deny(*, enforcement: bool, media_ok: bool, deny_mask_value: int,
                bit: int, allowed: bool) -> bool:
-    """Userspace mirror of the BPF decide() policy (excluding prior LSM denials)."""
-    if allowed:
-        return False
-    if not enforcement:
-        return False
-    if media_ok:
-        return False
-    return bool(deny_mask_value & bit)
+    """Userspace mirror of the global BPF decide() policy (no subject scope)."""
+    return decide_subject(
+        enforcement=enforcement, media_ok=media_ok, deny_mask_value=deny_mask_value,
+        bit=bit, allowed=allowed,
+    )
 
 
 def deny_mask(permissions: list[str] | None) -> int:
@@ -240,13 +263,28 @@ def classify_file_mask(mask: int) -> int:
 
 
 def custom_bits(item: dict | None) -> int:
+    """Global LSM bits contributed by one custom rule.
+
+    Always zero. A constrained rule must not become a machine-wide bit, and
+    a rule whose constraint cannot be enforced exactly must not either.
+    The class bit is applied only to the subject inside scope maps.
+    """
+    return 0
+
+
+def scope_class_bits(item: dict | None) -> int:
+    """Class bits a custom rule may set on its own subject, never globally."""
     if not item:
         return 0
     return _CUSTOM_BITS.get(item.get('type') or '', 0)
 
 
 def policy_bits(st: dict | None) -> int:
-    """Runtime bits selected by policy (built-ins plus custom rules)."""
+    """Runtime bits selected by built-in permissions.
+
+    Custom rules are not included. Folding one into this mask would allow
+    every path, user, or port in that class.
+    """
     st = st or {}
     mask = deny_mask(st.get('permissions') or [])
     for item in st.get('custom') or []:
@@ -255,7 +293,11 @@ def policy_bits(st: dict | None) -> int:
 
 
 def key_bits(name: str, st: dict | None = None) -> int:
-    """Bits one key file authorizes. root/boot/admin have no LSM bit of their own."""
+    """Global bits one key file authorizes.
+
+    root/boot/admin have no LSM bit of their own. A custom key also has no
+    global bit; its constraint is enforced on the named subject only.
+    """
     st = st or {}
     if not name or name in _NO_BPF_KEYS:
         return 0
@@ -266,6 +308,16 @@ def key_bits(name: str, st: dict | None = None) -> int:
         if item.get('key') == name:
             return custom_bits(item)
     return 0
+
+
+def _medium_has_custom(medium: dict, st: dict | None) -> bool:
+    keys = set((medium or {}).get('keys') or [])
+    if not keys:
+        return False
+    for item in (st or {}).get('custom') or []:
+        if isinstance(item, dict) and item.get('key') in keys:
+            return True
+    return False
 
 
 def medium_is_root(medium: dict | None) -> bool:
@@ -331,7 +383,10 @@ def runtime_required(medium: dict, st: dict | None = None) -> bool:
     """
     if medium_is_root(medium):
         return True
-    return bits_for_medium(medium, st) != 0
+    if bits_for_medium(medium, st) != 0:
+        return True
+    # A custom key has no global bit, but losing it must still refresh scope.
+    return _medium_has_custom(medium, st)
 
 
 def runtime_presence(st: dict | None = None) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
@@ -493,41 +548,434 @@ def _map_update(pin: Path, key: bytes, value: bytes) -> None:
 
 def _path_slot_count() -> int:
     if len(ALLOWED_EXEC_PATHS) > ALLOW_SLOTS:
-        raise EnforceError('allowlisted executable paths exceed BPF allow_inos slots')
+        raise EnforceError('allowlisted executable paths exceed BPF allow_inos capacity')
     return ALLOW_SLOTS
 
 
-def refresh_allow_maps() -> None:
-    """Rewrite allow_inos from ALLOWED_EXEC_PATHS. No-op when the map is not pinned.
+def allow_key_bytes(ino: int, dev: int) -> bytes:
+    """16-byte hash key: inode, kernel dev_t, pad. Matches struct allow_key."""
+    return struct.pack('QII', int(ino), int(dev) & 0xFFFFFFFF, 0)
 
-    Does not load BPF. A symlink is recorded only when its realpath is itself
-    on the allowlist, so a helper path pointing at bash does not authorize bash.
+
+def allow_value_bytes() -> bytes:
+    return struct.pack('I', 1)
+
+
+def scope_value_bytes(allow_bits: int, deny_bits: int) -> bytes:
+    return struct.pack('II', int(allow_bits) & 0xFFFFFFFF, int(deny_bits) & 0xFFFFFFFF)
+
+
+def scalar_key_bytes(value: int) -> bytes:
+    return struct.pack('I', int(value) & 0xFFFFFFFF)
+
+
+def _coerce_bpf_bytes(raw) -> bytes | None:
+    if isinstance(raw, str):
+        parts = raw.replace(',', ' ').split()
+        if not parts:
+            return b''
+        try:
+            return bytes(int(x, 16) for x in parts)
+        except ValueError:
+            return None
+    if isinstance(raw, list):
+        try:
+            return bytes(int(x, 16) if isinstance(x, str) else int(x) for x in raw)
+        except (TypeError, ValueError):
+            return None
+    if isinstance(raw, dict):
+        if 'hex' in raw:
+            return _coerce_bpf_bytes(raw.get('hex'))
+        if 'value' in raw:
+            return _coerce_bpf_bytes(raw.get('value'))
+    return None
+
+
+def parse_map_dump(stdout: str) -> dict[bytes, bytes]:
+    """Parse `bpftool -j map dump` into key bytes -> value bytes."""
+    text = (stdout or '').strip()
+    if not text or text == 'null':
+        return {}
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+    if isinstance(data, dict):
+        data = data.get('elements') or data.get('entries') or [data]
+    out: dict[bytes, bytes] = {}
+    for item in data or []:
+        if not isinstance(item, dict):
+            continue
+        key_raw = item.get('key')
+        val_raw = item.get('value')
+        formatted = item.get('formatted')
+        if isinstance(formatted, dict):
+            key_raw = formatted.get('key', key_raw)
+            val_raw = formatted.get('value', val_raw)
+        key = _coerce_bpf_bytes(key_raw)
+        value = _coerce_bpf_bytes(val_raw)
+        if key is None or value is None:
+            continue
+        out[key] = value
+    return out
+
+
+def diff_hash_map(current: dict[bytes, bytes], desired: dict[bytes, bytes]) -> tuple[list[bytes], dict[bytes, bytes]]:
+    """Keys to delete and keys whose value must be written. Unchanged keys are omitted."""
+    deletes = [key for key in current if key not in desired]
+    updates = {key: value for key, value in desired.items() if current.get(key) != value}
+    return deletes, updates
+
+
+def bpftool_batch_lines(pin: Path | str, deletes: list[bytes], updates: dict[bytes, bytes]) -> list[str]:
+    lines = []
+    for key in deletes:
+        lines.append('map delete pinned %s key hex %s' % (pin, ' '.join(_hex_bytes(key))))
+    for key, value in updates.items():
+        lines.append(
+            'map update pinned %s key hex %s value hex %s'
+            % (pin, ' '.join(_hex_bytes(key)), ' '.join(_hex_bytes(value)))
+        )
+    return lines
+
+
+def desired_allow_entries(paths: tuple[str, ...] | list[str] | None = None) -> dict[bytes, bytes]:
+    """One hash entry per existing allowlisted inode+device. Missing paths are omitted."""
+    chosen = list(ALLOWED_EXEC_PATHS if paths is None else paths)
+    if len(chosen) > ALLOW_SLOTS:
+        raise EnforceError('allowlisted executable paths exceed BPF allow_inos capacity')
+    entries: dict[bytes, bytes] = {}
+    for path in chosen:
+        ident = executable_identity(path)
+        if ident is None:
+            continue
+        ino, dev = ident
+        entries[allow_key_bytes(ino, dev)] = allow_value_bytes()
+    return entries
+
+
+def _scope_inode(path: str) -> tuple[int, int] | None:
+    """Exact inode for a scope path. Symlinks are not followed (fail closed)."""
+    if not path or not str(path).startswith('/') or os.path.islink(path):
+        return None
+    try:
+        st = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return None
+    mode = st.st_mode
+    if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode) or stat.S_ISCHR(mode) or stat.S_ISBLK(mode)):
+        return None
+    return int(st.st_ino), kernel_dev(st.st_dev) & 0xFFFFFFFF
+
+
+def _or_bits(store: dict, key, bits: int) -> None:
+    store[key] = int(store.get(key, 0)) | int(bits)
+
+
+def scope_plan(st: dict | None, *, verified: bool = False,
+               inactive_keys: set[str] | None = None) -> dict:
+    """Subject allow/deny bits for expressible custom rules.
+
+    Grants are installed only when the rule's key is active. Lock and replace
+    rules deny their own subject while the key is inactive. Nothing here is a
+    global bit. A subject that cannot be named (missing path, symlink, shell
+    ExecStart, address-only network rule) is not granted.
+    """
+    from ker.custom import iter_custom, login_uids, ports_of, rule_expressible, scope_paths, service_exec_path
+    inactive = set(inactive_keys or ())
+    ino_allow: dict[tuple[int, int], int] = {}
+    ino_deny: dict[tuple[int, int], int] = {}
+    uid_allow: dict[int, int] = {}
+    uid_deny: dict[int, int] = {}
+    port_allow: dict[int, int] = {}
+    port_deny: dict[int, int] = {}
+    narrow = 0
+    for item in iter_custom(st):
+        if not rule_expressible(item):
+            continue
+        mode = item.get('mode') or 'grant'
+        key_name = item.get('key')
+        active = bool(verified) and bool(key_name) and key_name not in inactive
+        bits = scope_class_bits(item)
+        if not bits:
+            continue
+        grant = active and mode in ('grant', 'lock', 'replace')
+        deny = (not active) and mode in ('lock', 'replace')
+        if not grant and not deny:
+            continue
+        # A replace rule narrows its class only when at least one subject
+        # was recorded. Otherwise it would deny the whole class with no
+        # exception, which is a wider effect than the constraint names.
+        recorded = False
+
+        def _mark(store, key, class_bits=bits):
+            nonlocal recorded
+            _or_bits(store, key, class_bits)
+            recorded = True
+
+        typ = item.get('type')
+        if typ in ('file_read', 'file_write', 'file_exec', 'command', 'device'):
+            store = ino_allow if grant else ino_deny
+            for path in scope_paths(item):
+                ident = _scope_inode(path)
+                if ident is None:
+                    continue
+                _mark(store, ident)
+        elif typ == 'service':
+            store = ino_allow if grant else ino_deny
+            units = (item.get('constraints') or {}).get('units') or []
+            if isinstance(units, str):
+                units = [units]
+            for unit in units:
+                binary = service_exec_path(str(unit))
+                if not binary:
+                    continue
+                ident = _scope_inode(binary)
+                if ident is None:
+                    continue
+                _mark(store, ident)
+        elif typ == 'login':
+            store = uid_allow if grant else uid_deny
+            for uid in login_uids(item):
+                _mark(store, int(uid))
+        elif typ == 'network':
+            store = port_allow if grant else port_deny
+            for port in ports_of(item.get('constraints') or {}) or []:
+                _mark(store, int(port))
+        if mode == 'replace' and active and recorded:
+            narrow |= bits
+    return {
+        'ino_allow': ino_allow,
+        'ino_deny': ino_deny,
+        'uid_allow': uid_allow,
+        'uid_deny': uid_deny,
+        'port_allow': port_allow,
+        'port_deny': port_deny,
+        'narrow_mask': narrow,
+    }
+
+
+def _combine_scope(allow_map: dict, deny_map: dict, key_bytes) -> dict[bytes, bytes]:
+    out: dict[bytes, bytes] = {}
+    for key in set(allow_map) | set(deny_map):
+        allow = int(allow_map.get(key, 0))
+        deny = int(deny_map.get(key, 0)) & ~allow
+        out[key_bytes(key)] = scope_value_bytes(allow, deny)
+    return out
+
+
+def desired_scope_entries(st: dict | None, *, verified: bool = False,
+                          inactive_keys: set[str] | None = None) -> dict[str, dict[bytes, bytes]]:
+    plan = scope_plan(st, verified=verified, inactive_keys=inactive_keys)
+    inos = _combine_scope(
+        plan['ino_allow'], plan['ino_deny'],
+        lambda ident: allow_key_bytes(ident[0], ident[1]),
+    )
+    uids = _combine_scope(plan['uid_allow'], plan['uid_deny'], scalar_key_bytes)
+    ports = _combine_scope(plan['port_allow'], plan['port_deny'], scalar_key_bytes)
+    if len(inos) > SCOPE_INO_SLOTS or len(uids) > SCOPE_UID_SLOTS or len(ports) > SCOPE_PORT_SLOTS:
+        raise EnforceError('custom scope exceeds BPF map capacity')
+    return {
+        'inos': inos,
+        'uids': uids,
+        'ports': ports,
+        'narrow_mask': plan['narrow_mask'],
+    }
+
+
+def _pinned_map_type(pin: Path) -> str | None:
+    if not _pin_exists(pin):
+        return None
+    try:
+        r = subprocess.run(
+            ['bpftool', '-j', 'map', 'show', 'pinned', str(pin)],
+            capture_output=True, text=True, timeout=3,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    text = ((r.stdout or '') + '\n' + (r.stderr or '')).lower()
+    if r.returncode == 0 and (r.stdout or '').strip():
+        try:
+            data = json.loads(r.stdout)
+        except json.JSONDecodeError:
+            data = None
+        if isinstance(data, list) and data:
+            data = data[0]
+        if isinstance(data, dict):
+            kind = str(data.get('type') or '').lower()
+            if kind:
+                return kind
+    if 'hash' in text:
+        return 'hash'
+    if 'array' in text:
+        return 'array'
+    return None
+
+
+def _dump_hash(pin: Path) -> dict[bytes, bytes]:
+    try:
+        r = subprocess.run(
+            ['bpftool', '-j', 'map', 'dump', 'pinned', str(pin)],
+            capture_output=True, text=True, timeout=3,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        raise EnforceError('bpftool map dump failed') from e
+    if r.returncode:
+        err = ((r.stderr or '') + (r.stdout or '')).lower()
+        if not (r.stdout or '').strip() or 'empty' in err or 'no such' in err:
+            return {}
+        raise EnforceError((r.stderr or r.stdout or 'bpftool map dump failed').strip())
+    if not (r.stdout or '').strip():
+        return {}
+    return parse_map_dump(r.stdout)
+
+
+def _bpftool_batch(lines: list[str]) -> None:
+    if not lines:
+        return
+    fd, name = tempfile.mkstemp(prefix='ker-bpf-')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+            fh.write('\n'.join(lines) + '\n')
+        r = subprocess.run(['bpftool', 'batch', 'file', name], capture_output=True, text=True)
+        if r.returncode == 0:
+            return
+        errors = []
+        for line in lines:
+            one = subprocess.run(['bpftool', *line.split()], capture_output=True, text=True)
+            if one.returncode:
+                errors.append((one.stderr or one.stdout or line).strip())
+        if errors:
+            raise EnforceError(errors[-1])
+    finally:
+        try:
+            os.unlink(name)
+        except OSError:
+            pass
+
+
+def _apply_hash_diff(pin: Path, desired: dict[bytes, bytes]) -> int:
+    """Write only the keys that changed. Returns how many keys were updated or deleted."""
+    current = _dump_hash(pin)
+    deletes, updates = diff_hash_map(current, desired)
+    lines = bpftool_batch_lines(pin, deletes, updates)
+    if not lines:
+        return 0
+    _bpftool_batch(lines)
+    return len(lines)
+
+
+_MIGRATING = False
+
+
+def _migrate_legacy_allow_map() -> None:
+    """Replace a pinned ARRAY allow_inos with the current object.
+
+    The enforcement flag already in cfg is written back after the reload.
+    A missing cfg is left at zero, so this never turns enforcement on by itself.
+    """
+    global _MIGRATING
+    if _MIGRATING:
+        return
+    _MIGRATING = True
+    try:
+        previous = read_maps() or {}
+        unload_bpf()
+        if _pin_exists(PIN_DIR):
+            raise EnforceError('old BPF pin could not be removed')
+        load_bpf()
+        kind = _pinned_map_type(PIN_DIR / 'allow_inos')
+        if kind == 'array':
+            raise EnforceError('reloaded BPF still has the legacy allow map')
+        if not previous:
+            return
+        update_maps(
+            enforcement=bool(previous.get('enforcement')),
+            media_ok=bool(previous.get('media_ok')),
+            permissions=[],
+            deny_mask_value=int(previous.get('deny_mask') or 0),
+            narrow_mask=int(previous.get('narrow_mask') or 0),
+            scopes_verified=bool(previous.get('media_ok')),
+            skip_migrate=True,
+        )
+    finally:
+        _MIGRATING = False
+
+
+def refresh_allow_maps() -> None:
+    """Insert allow_inos entries for concrete allowlisted paths.
+
+    No-op when the map is not pinned. Does not load BPF on its own. An old
+    64-slot array is recreated as a hash without changing the enforcement
+    flag. Unchanged keys are not rewritten, so a udev event does not spawn
+    one bpftool process per slot.
     """
     if not may_load_bpf():
         return
     pin = PIN_DIR / 'allow_inos'
     if not _pin_exists(pin):
         return
-    slots = _path_slot_count()
-    paths = list(ALLOWED_EXEC_PATHS)
-    for i in range(slots):
-        path = paths[i] if i < len(paths) else ''
-        ident = executable_identity(path) if path else None
-        if ident is None:
-            value = struct.pack('QII', 0, 0, 0)
-        else:
-            ino, dev = ident
-            value = struct.pack('QII', ino, dev & 0xFFFFFFFF, 1)
-        _map_update(pin, struct.pack('I', i), value)
+    kind = _pinned_map_type(pin)
+    if kind == 'array':
+        if _MIGRATING:
+            return
+        _migrate_legacy_allow_map()
+        return
+    if kind not in ('hash', 'percpu_hash'):
+        return
+    _apply_hash_diff(pin, desired_allow_entries())
+
+
+def refresh_scope_maps(*, scopes_verified: bool = False,
+                       inactive_keys: set[str] | None = None) -> None:
+    """Sync custom subject maps. Missing pins are left alone (older objects)."""
+    if not may_load_bpf():
+        return
+    try:
+        st = load_state()
+    except Exception:
+        st = {}
+    desired = desired_scope_entries(st, verified=scopes_verified, inactive_keys=inactive_keys)
+    for name, entries in (
+        ('scope_inos', desired['inos']),
+        ('scope_uids', desired['uids']),
+        ('scope_ports', desired['ports']),
+    ):
+        pin = PIN_DIR / name
+        if not _pin_exists(pin):
+            continue
+        if _pinned_map_type(pin) not in ('hash', 'percpu_hash'):
+            continue
+        _apply_hash_diff(pin, entries)
 
 
 def update_maps(*, enforcement: bool, media_ok: bool, permissions: list[str] | None,
-                deny_mask_value: int | None = None) -> None:
+                deny_mask_value: int | None = None, narrow_mask: int | None = None,
+                scopes_verified: bool = False, inactive_keys: set[str] | None = None,
+                skip_migrate: bool = False) -> None:
     if not may_load_bpf():
         raise EnforceError('BPF map update refused on bare-metal host')
+    if not skip_migrate:
+        allow_pin = PIN_DIR / 'allow_inos'
+        if _pin_exists(allow_pin) and _pinned_map_type(allow_pin) == 'array':
+            _migrate_legacy_allow_map()
+    if narrow_mask is None:
+        try:
+            st_now = load_state()
+        except Exception:
+            st_now = {}
+        narrow_mask = scope_plan(
+            st_now, verified=bool(scopes_verified), inactive_keys=inactive_keys,
+        )['narrow_mask']
     key = struct.pack('I', 0)
     mask = deny_mask(permissions) if deny_mask_value is None else int(deny_mask_value)
-    value = struct.pack('IIII', 1 if enforcement else 0, 1 if media_ok else 0, mask, 0)
+    value = struct.pack(
+        'IIII',
+        1 if enforcement else 0,
+        1 if media_ok else 0,
+        mask & 0xFFFFFFFF,
+        int(narrow_mask) & 0xFFFFFFFF,
+    )
     mp = _map_path()
     _map_update(mp, key, value)
     # Best-effort: an older pinned object may not have allow_inos yet.
@@ -535,6 +983,11 @@ def update_maps(*, enforcement: bool, media_ok: bool, permissions: list[str] | N
         refresh_allow_maps()
     except EnforceError:
         if _pin_exists(PIN_DIR / 'allow_inos'):
+            raise
+    try:
+        refresh_scope_maps(scopes_verified=scopes_verified, inactive_keys=inactive_keys)
+    except EnforceError:
+        if _pin_exists(PIN_DIR / 'scope_inos'):
             raise
 
 
@@ -622,6 +1075,7 @@ def read_maps() -> dict | None:
                 'enforcement': bool(fv.get('enforcement')),
                 'media_ok': bool(fv.get('media_ok')),
                 'deny_mask': int(fv.get('deny_mask') or 0),
+                'narrow_mask': int(fv.get('narrow_mask') or fv.get('reserved') or 0),
             }
     raw = data.get('value') if isinstance(data, dict) else None
     if isinstance(raw, dict):
@@ -630,6 +1084,7 @@ def read_maps() -> dict | None:
                 'enforcement': bool(raw.get('enforcement')),
                 'media_ok': bool(raw.get('media_ok')),
                 'deny_mask': int(raw.get('deny_mask') or 0),
+                'narrow_mask': int(raw.get('narrow_mask') or raw.get('reserved') or 0),
             }
         raw = raw.get('value')
     if isinstance(raw, str):
@@ -648,7 +1103,11 @@ def read_maps() -> dict | None:
     if len(buf) < 12:
         return None
     enf, mok, mask = struct.unpack_from('III', buf, 0)
-    return {'enforcement': bool(enf), 'media_ok': bool(mok), 'deny_mask': mask}
+    narrow = struct.unpack_from('I', buf, 12)[0] if len(buf) >= 16 else 0
+    return {
+        'enforcement': bool(enf), 'media_ok': bool(mok),
+        'deny_mask': mask, 'narrow_mask': narrow,
+    }
 
 
 def _ensure_bpf_if_enforcing(st: dict) -> bool:
@@ -659,6 +1118,12 @@ def _ensure_bpf_if_enforcing(st: dict) -> bool:
         return False
     try:
         _map_path()
+        allow = PIN_DIR / 'allow_inos'
+        # An in-place upgrade from the 0.1.0 array map recreates the hash
+        # here. The previous enforcement flag is written back; a zero cfg
+        # stays off.
+        if _pin_exists(allow) and _pinned_map_type(allow) == 'array':
+            _migrate_legacy_allow_map()
         return True
     except EnforceError:
         pass
@@ -695,23 +1160,40 @@ def _recover_sshd() -> None:
             pass
 
 
-def _push_maps(st: dict, denied: int, *, recover_ssh: bool = False) -> None:
+def _inactive_keys(*groups) -> set[str]:
+    keys: set[str] = set()
+    for group in groups:
+        for medium in group or []:
+            if isinstance(medium, dict):
+                keys.update(medium.get('keys') or [])
+    return keys
+
+
+def _push_maps(st: dict, denied: int, *, recover_ssh: bool = False,
+               scopes_verified: bool = False, inactive_keys: set[str] | None = None) -> None:
     """Push the bits that are denied right now.
 
     media_ok is 1 only when nothing is denied. The mask then still records the
     armed policy bits; decide() ignores the mask while media_ok is set.
     When some bits are denied, the mask is exactly those bits — not every
     permission the policy selected.
+
+    Custom scope grants are written only when scopes_verified is true. Until
+    then a constrained rule does not open its subject.
     """
     policy = policy_bits(st)
     denied = int(denied) & 0xFFFFFFFF
     media_ok_flag = denied == 0
     mask = policy if media_ok_flag else denied
+    plan = scope_plan(st, verified=bool(scopes_verified), inactive_keys=inactive_keys)
     update_maps(
         enforcement=True,
         media_ok=media_ok_flag,
         permissions=st.get('permissions') or [],
         deny_mask_value=mask,
+        narrow_mask=int(plan['narrow_mask']),
+        scopes_verified=bool(scopes_verified),
+        inactive_keys=inactive_keys,
     )
     if not media_ok_flag:
         try:
@@ -767,7 +1249,11 @@ def apply_presence(*, verify_if_present: bool = False) -> dict:
             for medium in req_present:
                 present_bits |= bits_for_medium(medium, st)
             denied = fresh | (prev & present_bits)
-        _push_maps(st, denied)
+        _push_maps(
+            st, denied,
+            scopes_verified=bool(current.get('media_ok')),
+            inactive_keys=_inactive_keys(req_missing),
+        )
         return {
             'ok': True, 'media_ok': denied == 0, 'present': False,
             'missing': missing_paths, 'runtime_missing': runtime_paths,
@@ -787,7 +1273,10 @@ def apply_presence(*, verify_if_present: bool = False) -> dict:
             runtime_paths = _paths(req_missing)
             if req_missing:
                 fresh = denied_bits(st, req_missing)
-                _push_maps(st, fresh)
+                _push_maps(
+                    st, fresh, scopes_verified=False,
+                    inactive_keys=_inactive_keys(req_missing),
+                )
                 return {
                     'ok': True, 'media_ok': fresh == 0, 'present': False,
                     'missing': missing_paths, 'runtime_missing': runtime_paths,
@@ -816,7 +1305,14 @@ def apply_presence(*, verify_if_present: bool = False) -> dict:
                 denied = denied_bits(st, report.get('missing') or [], report.get('failed') or [])
                 verified = True
             was_denied = not current.get('media_ok')
-            _push_maps(st, denied, recover_ssh=bool(denied == 0 and was_denied))
+            _push_maps(
+                st, denied,
+                recover_ssh=bool(denied == 0 and was_denied),
+                scopes_verified=bool(verified) and not req_missing,
+                inactive_keys=_inactive_keys(
+                    req_missing, report.get('missing'), report.get('failed'),
+                ),
+            )
             out = {
                 'ok': True, 'media_ok': denied == 0, 'present': not req_missing and denied == 0,
                 'devices_present': not req_missing,
@@ -1079,12 +1575,26 @@ def set_enforcement(enabled: bool, *, confirm: bool = True, already_confirmed: b
                 'enforcement was not enabled'
             )
         load_bpf()
-        update_maps(enforcement=True, media_ok=True, permissions=st.get('permissions') or [])
+        # media_ok() already verified signatures above. The armed mask stays
+        # the selected policy bits; it is not cleared.
+        update_maps(
+            enforcement=True, media_ok=True,
+            permissions=st.get('permissions') or [],
+            deny_mask_value=policy_bits(st),
+            scopes_verified=True,
+        )
         applied = True
     else:
         if may_load_bpf() and PIN_DIR.exists():
             try:
-                update_maps(enforcement=False, media_ok=True, permissions=st.get('permissions') or [])
+                # Leave a deny mask in place so a later enforcement=1 cannot
+                # observe media_ok=1 with an empty mask.
+                update_maps(
+                    enforcement=False, media_ok=False,
+                    permissions=st.get('permissions') or [],
+                    deny_mask_value=policy_bits(st),
+                    scopes_verified=False,
+                )
             except EnforceError:
                 pass
         applied = True

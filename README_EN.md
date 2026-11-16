@@ -38,7 +38,7 @@ The first run of `ker` starts a terminal wizard (English / Simplified Chinese / 
 ## How media and keys work
 
 - KER lists every recognizable block device (not only USB sticks). After confirmation it formats the device and writes a sealed file set.
-- Rewritable removable media uses FAT32, hard disks use ext4, DVD-R gets an ISO9660 image, and WORM media is written only when empty — it is never reformatted.
+- Rewritable removable media uses FAT32, hard disks use ext4, DVD-R gets an ISO9660 image, and WORM media is written only when empty — it is never reformatted. The optical disc is a data image; see [docs/dvd-image.md](docs/dvd-image.md).
 - Each key is 10MB. The signed object on the medium is `bundle.json`, a hash list of the key files. It carries a detached GPG signature (`bundle.json.sig`) and an OpenSSL RSA signature (`bundle.json.ksig`). Individual pem files are not signed on their own; their integrity is the hash in that list. `root.pem` is not encrypted. Every other key is encrypted with the fixed section of `root.pem` and then listed. This is not a per-pem signature. A holder of `root.pem` can unwrap the other keys; KER does not claim confidentiality against that holder. Without the root key, no permission can be established.
 - Unwrapped material is placed in the kernel keyring where possible, not written in cleartext under ordinary directories.
 - The default is a single medium. Keys can also be split across several disks, each signed on its own. The admin key `admin.pem` is required for `ker console`.
@@ -95,14 +95,15 @@ Once enforcement is on:
 - `ker enforce --watch` runs as a persistent systemd service and is enabled so that BPF maps are restored at boot;
 - udev triggers an immediate presence check when block devices appear or disappear, with a timer as a backup;
 - **One medium, one set of bits**: removing or failing to verify the medium that holds `ssh.pem` denies SSH only. Read, write, execute, network, and root login follow their own key media. A missing `root.pem` medium denies every selected runtime permission, because no permission can be established without it. `boot.pem` is enforced by the early-boot hook, and `admin.pem` is enforced by `ker console`.
+- **Custom rules stay scoped.** A rule that names paths, users, ports, or units authorizes only those subjects. If a constraint cannot be checked exactly, that rule authorizes nothing and is not widened into a machine-wide execute, read, write, or network bit.
 - **Deny first, then verify**: removing a runtime-required medium clears the bits that medium authorizes immediately, without waiting for a mount or a signature check. Reinserting it and a successful verify restores those bits.
 - Enforcement is never enabled by a package install or upgrade. Turn it off with `ker enforce --set test`.
 
 ## Cluster, console, and uninstall
 
 - Master/child cluster: `ker addnet`, `ker token`, and `ker serve`. A join installs a new trust anchor only after an out-of-band fingerprint (`ker addnet --fingerprint`) or after a root/admin medium already on the machine verifies that anchor. The node does not install the token's trust and then verify the token with the trust it just wrote. Children fail closed if the master is lost.
-- Console and key rotation: `ker console` (admin media required). Rotation really clears kernel enforcement before rewriting media, then restores the previous mode. BPF maps and the `ker-enforcer` units match that state.
-- Lost media: `ker console revoke-medium --drop` or `--replace /dev/...`. The remaining root medium must verify; if the root medium itself is lost, the admin medium is the proof and a replacement device is required. The new signing keys are what make the lost disk stop verifying. There is no separate CRL.
+- Console and key rotation: `ker console` (admin media required). Rotation clears kernel enforcement before rewriting media. It does not set `media_ok` until the new media verify. A failed replug leaves enforcement fail-closed: the flag may be restored, but the selected bits stay in the deny mask. BPF maps and the `ker-enforcer` units follow that result.
+- Lost media: `ker revoke-medium --drop` or `--replace /dev/...` (the same action as `ker console revoke-medium`). Proof is a remaining root medium, or the admin medium when the root medium itself is lost. A present root medium is enough; the operator is not asked for an admin disk as well. If both the root medium and the admin medium are missing, the command fails closed and will not revoke without proof. The new signing keys are what make the lost disk stop verifying. There is no separate CRL.
 - Uninstall: `ker uninstall` requires root and verification of the root medium plus every permission medium. A master can dispatch a signed uninstall to online children; offline children must be uninstalled locally.
 
 ## Build and test

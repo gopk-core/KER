@@ -289,6 +289,16 @@ def run(lang: str = 'zh-CN', argv: list[str] | None = None) -> int:
     argv = list(argv or [])
     args = _parser().parse_args(argv)
     args.lang = lang
+    # Lost-media revocation is proved by a remaining root medium, or by the
+    # admin medium when root itself is gone. Do not demand an admin disk
+    # when root is still present. rotate() fails closed if both are missing.
+    if args.action == 'revoke-medium':
+        try:
+            cmd_revoke_medium(load_state(), args)
+            return 0
+        except Exception as e:
+            print(str(e), flush=True)
+            return 1
     try:
         _require_admin(st, args)
     except ConsoleError as e:
