@@ -76,7 +76,16 @@ allowed.
 A custom login rule is applied by the same PAM helper, on top of `ssh.pem`.
 The rule authorizes only the users it names. Another user is not covered by
 that rule. If the named user's medium is missing while enforcement is on,
-that user is denied. Test mode still does not block.
+that user is denied. Test mode still does not block. A login grant is not an
+allow bit on that uid's ordinary exec. Non-root login rules stay on this
+helper. A login rule for uid 0 is also honored on the root-login and
+setuid-to-root paths.
+
+The helper does not run a full media verify on every account check. It reuses
+a result that is still tied to the same present and missing media, key
+generation, and trust anchors. A udev or presence update that removes a
+medium, a failed verify, or a generation change invalidates that result
+immediately. There is no timer that keeps the previous verified key set.
 
 The installer refuses to modify sshd or PAM on a host where
 `ker-guard.service` is active, so this production machine's real sshd is not

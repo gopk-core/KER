@@ -118,6 +118,8 @@ ALLOW_SLOTS = 1024
 SCOPE_INO_SLOTS = 1024
 SCOPE_UID_SLOTS = 256
 SCOPE_PORT_SLOTS = 256
+SCOPE_NET4_SLOTS = 256
+SCOPE_NET6_SLOTS = 256
 
 # Names that must never be treated as an allow by themselves.
 FORBIDDEN_COMMS = (
@@ -191,6 +193,10 @@ def decide_subject(*, enforcement: bool, media_ok: bool, deny_mask_value: int,
 
     A scoped allow clears only its own bits. It does not clear a deny for a
     different path, user, or port, because that subject is not in_scope.
+
+    narrow_mask is applied even when media_ok is set. media_ok == 1 does not
+    open a class that narrow_mask still names: a replace rule is policy, not
+    a medium-presence flag. deny_mask is applied only when media_ok is 0.
     """
     if allowed or not enforcement:
         return False
@@ -205,11 +211,102 @@ def decide_subject(*, enforcement: bool, media_ok: bool, deny_mask_value: int,
 
 def would_deny(*, enforcement: bool, media_ok: bool, deny_mask_value: int,
                bit: int, allowed: bool) -> bool:
-    """Userspace mirror of the global BPF decide() policy (no subject scope)."""
+    """Userspace mirror of the global BPF decide() policy (no subject scope).
+
+    narrow_mask defaults to 0 here. A replace rule's narrow_mask still denies
+    when media_ok is 1; pass it through decide_subject to see that.
+    """
     return decide_subject(
         enforcement=enforcement, media_ok=media_ok, deny_mask_value=deny_mask_value,
         bit=bit, allowed=allowed,
     )
+
+
+def bprm_denies(*, enforcement: bool, media_ok: bool, deny_mask_value: int,
+                uid: int, allowed: bool = False, narrow_mask: int = 0,
+                file_allow: int = 0, file_deny: int = 0, have_file: bool = False,
+                uid_allow: int = 0, uid_deny: int = 0, have_uid: bool = False) -> bool:
+    """Userspace mirror of lsm/bprm_check_security.
+
+    The run class uses the file scope. Login scope is consulted only when
+    euid is 0, and only for BIT_ROOTUSER. A grant for uid 1000, even if its
+    allow bits are passed in, does not clear BIT_ROOTUSER or BIT_ROOTSU on
+    that uid's ordinary exec.
+    """
+    if decide_subject(
+        enforcement=enforcement, media_ok=media_ok, deny_mask_value=deny_mask_value,
+        bit=BIT['run'], allowed=allowed, narrow_mask=narrow_mask,
+        scope_allow=file_allow, scope_deny=file_deny, in_scope=have_file,
+    ):
+        return True
+    if int(uid) != 0:
+        return False
+    return decide_subject(
+        enforcement=enforcement, media_ok=media_ok, deny_mask_value=deny_mask_value,
+        bit=BIT['rootuser'], allowed=allowed, narrow_mask=narrow_mask,
+        scope_allow=uid_allow if have_uid else 0,
+        scope_deny=uid_deny if have_uid else 0,
+        in_scope=bool(have_uid),
+    )
+
+
+def setuid_denies(*, enforcement: bool, media_ok: bool, deny_mask_value: int,
+                  new_uid: int, allowed: bool = False, narrow_mask: int = 0,
+                  uid_allow: int = 0, uid_deny: int = 0, have_uid: bool = False) -> bool:
+    """Userspace mirror of lsm/task_fix_setuid.
+
+    Only a transition to euid 0 is a root login / setuid-to-root decision.
+    BIT_ROOTSU is checked without the login scope, so a login grant cannot
+    clear it. A uid-0 login grant or lock is then applied to BIT_ROOTUSER.
+    A scope for any other uid is ignored.
+    """
+    if int(new_uid) != 0:
+        return False
+    if decide_subject(
+        enforcement=enforcement, media_ok=media_ok, deny_mask_value=deny_mask_value,
+        bit=BIT['rootsu'], allowed=allowed, narrow_mask=narrow_mask,
+    ):
+        return True
+    if not have_uid or not ((int(uid_allow) | int(uid_deny)) & BIT['rootuser']):
+        return False
+    return decide_subject(
+        enforcement=enforcement, media_ok=media_ok, deny_mask_value=deny_mask_value,
+        bit=BIT['rootuser'], allowed=allowed, narrow_mask=narrow_mask,
+        scope_allow=uid_allow, scope_deny=uid_deny, in_scope=True,
+    )
+
+
+def connect_scope_bits(plan: dict | None, addr: str | None, port: int) -> tuple[int, int]:
+    """Allow and deny bits the socket_connect hook would see for this tuple.
+
+    An exact address+port entry wins over a port-only entry, so a grant for
+    10.0.0.5:443 does not become an allow for every address on 443. A
+    ports-only entry matches any destination address. Returns (allow, deny)
+    with deny already cleared of bits the matching allow names.
+    """
+    from ker.custom import parse_exact_ip
+    plan = plan or {}
+    try:
+        port_n = int(port)
+    except (TypeError, ValueError):
+        return 0, 0
+    parsed = parse_exact_ip(addr) if addr is not None else None
+    if parsed is not None:
+        family, raw = parsed
+        key = (raw, port_n)
+        if family == '4':
+            allow_map = plan.get('net4_allow') or {}
+            deny_map = plan.get('net4_deny') or {}
+        else:
+            allow_map = plan.get('net6_allow') or {}
+            deny_map = plan.get('net6_deny') or {}
+        if key in allow_map or key in deny_map:
+            allow = int(allow_map.get(key, 0))
+            deny = int(deny_map.get(key, 0)) & ~allow
+            return allow, deny
+    allow = int((plan.get('port_allow') or {}).get(port_n, 0))
+    deny = int((plan.get('port_deny') or {}).get(port_n, 0)) & ~allow
+    return allow, deny
 
 
 def deny_mask(permissions: list[str] | None) -> int:
@@ -236,6 +333,9 @@ _CUSTOM_BITS = {
     'file_write': BIT['write'],
     'file_exec': BIT['run'],
     'command': BIT['run'],
+    # Root-account login only. Not rootsu, and not an allow on a non-root
+    # uid's ordinary exec. scope_plan records it for uid 0 alone; other
+    # login rules are enforced by the SSH PAM helper.
     'login': BIT['rootuser'],
     'network': BIT['network'],
     'service': BIT['run'],
@@ -569,6 +669,27 @@ def scalar_key_bytes(value: int) -> bytes:
     return struct.pack('I', int(value) & 0xFFFFFFFF)
 
 
+def net4_key_bytes(addr: bytes, port: int) -> bytes:
+    """8-byte key: 4 wire-order address bytes, host-order port, pad.
+
+    Matches struct net4_key in src/bpf/ker.bpf.c.
+    """
+    if len(addr) != 4:
+        raise EnforceError('network v4 key must be 4 bytes')
+    return struct.pack('<4sHH', addr, int(port) & 0xFFFF, 0)
+
+
+def net6_key_bytes(addr: bytes, port: int) -> bytes:
+    """20-byte key: 16 wire-order address bytes, host-order port, pad.
+
+    Matches struct net6_key in src/bpf/ker.bpf.c (no trailing compiler pad;
+    the struct's alignment is 2).
+    """
+    if len(addr) != 16:
+        raise EnforceError('network v6 key must be 16 bytes')
+    return struct.pack('<16sHH', addr, int(port) & 0xFFFF, 0)
+
+
 def _coerce_bpf_bytes(raw) -> bytes | None:
     if isinstance(raw, str):
         parts = raw.replace(',', ' ').split()
@@ -679,9 +800,19 @@ def scope_plan(st: dict | None, *, verified: bool = False,
     Grants are installed only when the rule's key is active. Lock and replace
     rules deny their own subject while the key is inactive. Nothing here is a
     global bit. A subject that cannot be named (missing path, symlink, shell
-    ExecStart, address-only network rule) is not granted.
+    ExecStart, address-only / interface-only / direction-only network rule,
+    or a port rule that also names a constraint connect() cannot check) is
+    not granted. A ports-only network rule is a grant for that port on any
+    destination address. A rule that also names exact addresses is stored
+    as address+port, never as the port alone.
+
+    Login allow/deny bits are recorded only for uid 0. A login grant for
+    any other uid is not an LSM allow: it must not clear BIT_ROOTUSER on
+    that uid's ordinary exec. The SSH PAM helper enforces those rules.
     """
-    from ker.custom import iter_custom, login_uids, ports_of, rule_expressible, scope_paths, service_exec_path
+    from ker.custom import (
+        iter_custom, login_uids, network_scope, rule_expressible, scope_paths, service_exec_path,
+    )
     inactive = set(inactive_keys or ())
     ino_allow: dict[tuple[int, int], int] = {}
     ino_deny: dict[tuple[int, int], int] = {}
@@ -689,6 +820,10 @@ def scope_plan(st: dict | None, *, verified: bool = False,
     uid_deny: dict[int, int] = {}
     port_allow: dict[int, int] = {}
     port_deny: dict[int, int] = {}
+    net4_allow: dict[tuple[bytes, int], int] = {}
+    net4_deny: dict[tuple[bytes, int], int] = {}
+    net6_allow: dict[tuple[bytes, int], int] = {}
+    net6_deny: dict[tuple[bytes, int], int] = {}
     narrow = 0
     for item in iter_custom(st):
         if not rule_expressible(item):
@@ -735,13 +870,31 @@ def scope_plan(st: dict | None, *, verified: bool = False,
                     continue
                 _mark(store, ident)
         elif typ == 'login':
+            # uid 0 only. Non-root login rules stay on the PAM path.
             store = uid_allow if grant else uid_deny
             for uid in login_uids(item):
-                _mark(store, int(uid))
+                if int(uid) != 0:
+                    continue
+                _mark(store, 0)
         elif typ == 'network':
-            store = port_allow if grant else port_deny
-            for port in ports_of(item.get('constraints') or {}) or []:
-                _mark(store, int(port))
+            scope = network_scope(item.get('constraints') or {})
+            if not scope:
+                continue
+            if scope['addrs']:
+                for family, raw_addr in scope['addrs']:
+                    if family == '4':
+                        store = net4_allow if grant else net4_deny
+                    else:
+                        store = net6_allow if grant else net6_deny
+                    for port in scope['ports']:
+                        _mark(store, (raw_addr, int(port)))
+            else:
+                # Ports only (or ports plus outbound, which connect() is).
+                # Any destination address on that port. Do not do this when
+                # the rule also named an address.
+                store = port_allow if grant else port_deny
+                for port in scope['ports']:
+                    _mark(store, int(port))
         if mode == 'replace' and active and recorded:
             narrow |= bits
     return {
@@ -751,6 +904,10 @@ def scope_plan(st: dict | None, *, verified: bool = False,
         'uid_deny': uid_deny,
         'port_allow': port_allow,
         'port_deny': port_deny,
+        'net4_allow': net4_allow,
+        'net4_deny': net4_deny,
+        'net6_allow': net6_allow,
+        'net6_deny': net6_deny,
         'narrow_mask': narrow,
     }
 
@@ -773,12 +930,26 @@ def desired_scope_entries(st: dict | None, *, verified: bool = False,
     )
     uids = _combine_scope(plan['uid_allow'], plan['uid_deny'], scalar_key_bytes)
     ports = _combine_scope(plan['port_allow'], plan['port_deny'], scalar_key_bytes)
-    if len(inos) > SCOPE_INO_SLOTS or len(uids) > SCOPE_UID_SLOTS or len(ports) > SCOPE_PORT_SLOTS:
+    net4 = _combine_scope(
+        plan.get('net4_allow') or {}, plan.get('net4_deny') or {},
+        lambda item: net4_key_bytes(item[0], item[1]),
+    )
+    net6 = _combine_scope(
+        plan.get('net6_allow') or {}, plan.get('net6_deny') or {},
+        lambda item: net6_key_bytes(item[0], item[1]),
+    )
+    if (
+        len(inos) > SCOPE_INO_SLOTS or len(uids) > SCOPE_UID_SLOTS
+        or len(ports) > SCOPE_PORT_SLOTS or len(net4) > SCOPE_NET4_SLOTS
+        or len(net6) > SCOPE_NET6_SLOTS
+    ):
         raise EnforceError('custom scope exceeds BPF map capacity')
     return {
         'inos': inos,
         'uids': uids,
         'ports': ports,
+        'net4': net4,
+        'net6': net6,
         'narrow_mask': plan['narrow_mask'],
     }
 
@@ -940,6 +1111,8 @@ def refresh_scope_maps(*, scopes_verified: bool = False,
         ('scope_inos', desired['inos']),
         ('scope_uids', desired['uids']),
         ('scope_ports', desired['ports']),
+        ('scope_net4', desired.get('net4') or {}),
+        ('scope_net6', desired.get('net6') or {}),
     ):
         pin = PIN_DIR / name
         if not _pin_exists(pin):
@@ -1169,13 +1342,30 @@ def _inactive_keys(*groups) -> set[str]:
     return keys
 
 
+def _invalidate_login_key_cache() -> None:
+    """Drop the PAM verified-key cache. Deny-first: never leave a stale allow.
+
+    Called when a medium is absent or a verify failed. A later hook call
+    must not reuse the previous verified set. Best-effort: a missing
+    runtime directory is not an enforcement error.
+    """
+    try:
+        from ker.hooks import invalidate_verified_custom_keys
+        invalidate_verified_custom_keys()
+    except Exception:
+        return
+
+
 def _push_maps(st: dict, denied: int, *, recover_ssh: bool = False,
                scopes_verified: bool = False, inactive_keys: set[str] | None = None) -> None:
     """Push the bits that are denied right now.
 
-    media_ok is 1 only when nothing is denied. The mask then still records the
-    armed policy bits; decide() ignores the mask while media_ok is set.
-    When some bits are denied, the mask is exactly those bits — not every
+    media_ok is 1 only when no selected runtime bit is denied for a missing
+    or unverified medium. The mask then still records the armed policy bits.
+    decide() does not apply deny_mask while media_ok is set. It does still
+    apply narrow_mask: media_ok == 1 does not open a class that an active
+    replace rule has narrowed. narrow_mask is policy, not a presence flag.
+    When some bits are denied, deny_mask is exactly those bits — not every
     permission the policy selected.
 
     Custom scope grants are written only when scopes_verified is true. Until
@@ -1249,6 +1439,7 @@ def apply_presence(*, verify_if_present: bool = False) -> dict:
             for medium in req_present:
                 present_bits |= bits_for_medium(medium, st)
             denied = fresh | (prev & present_bits)
+        _invalidate_login_key_cache()
         _push_maps(
             st, denied,
             scopes_verified=bool(current.get('media_ok')),
@@ -1273,6 +1464,7 @@ def apply_presence(*, verify_if_present: bool = False) -> dict:
             runtime_paths = _paths(req_missing)
             if req_missing:
                 fresh = denied_bits(st, req_missing)
+                _invalidate_login_key_cache()
                 _push_maps(
                     st, fresh, scopes_verified=False,
                     inactive_keys=_inactive_keys(req_missing),
@@ -1305,6 +1497,8 @@ def apply_presence(*, verify_if_present: bool = False) -> dict:
                 denied = denied_bits(st, report.get('missing') or [], report.get('failed') or [])
                 verified = True
             was_denied = not current.get('media_ok')
+            if req_missing or not report.get('ok') or report.get('failed') or report.get('missing'):
+                _invalidate_login_key_cache()
             _push_maps(
                 st, denied,
                 recover_ssh=bool(denied == 0 and was_denied),

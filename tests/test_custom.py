@@ -138,6 +138,226 @@ class CustomTests(unittest.TestCase):
         self.assertEqual(policy_bits(st) & BIT['run'], 0)
         self.assertEqual(scope_plan(st, verified=True, inactive_keys=set())['ino_allow'], {})
 
+    def test_network_address_is_not_widened_to_the_port(self):
+        import ipaddress
+        from ker.custom import custom_authorizes, rule_expressible
+        from ker.enforce import BIT, connect_scope_bits, scope_plan
+        exact = validate_custom({
+            'name': 'one', 'type': 'network', 'mode': 'grant',
+            'constraints': {'ports': [443], 'addrs': ['10.0.0.5']},
+        })
+        st = {'custom': [exact]}
+        active = {'one.pem'}
+        self.assertTrue(rule_expressible(exact))
+        self.assertTrue(custom_authorizes(
+            st, kind='network', port=443, addr='10.0.0.5', active_keys=active,
+        ))
+        self.assertFalse(custom_authorizes(
+            st, kind='network', port=443, addr='1.2.3.4', active_keys=active,
+        ))
+        self.assertFalse(custom_authorizes(
+            st, kind='network', port=80, addr='10.0.0.5', active_keys=active,
+        ))
+        # Port alone is not enough when the rule named an address.
+        self.assertFalse(custom_authorizes(st, kind='network', port=443, active_keys=active))
+        plan = scope_plan(st, verified=True, inactive_keys=set())
+        self.assertNotIn(443, plan['port_allow'])
+        key = (ipaddress.IPv4Address('10.0.0.5').packed, 443)
+        self.assertEqual(plan['net4_allow'].get(key), BIT['network'])
+        self.assertNotIn((ipaddress.IPv4Address('10.0.0.5').packed, 80), plan['net4_allow'])
+        self.assertEqual(connect_scope_bits(plan, '1.2.3.4', 443)[0] & BIT['network'], 0)
+        self.assertEqual(connect_scope_bits(plan, '10.0.0.5', 80)[0] & BIT['network'], 0)
+        self.assertEqual(connect_scope_bits(plan, '10.0.0.5', 443)[0] & BIT['network'], BIT['network'])
+
+        closed = [
+            {'addrs': ['10.0.0.5']},
+            {'interfaces': ['eth0']},
+            {'direction': 'outbound'},
+            {'direction': 'inbound'},
+            {'ports': [443], 'interfaces': ['eth0']},
+            {'ports': [443], 'addrs': ['10.0.0.0/8']},
+            {'ports': [443], 'direction': 'inbound'},
+            {'ports': [443], 'addrs': ['example.com']},
+        ]
+        for constraints in closed:
+            rule = validate_custom({
+                'name': 'closed', 'type': 'network', 'mode': 'grant',
+                'constraints': constraints,
+            })
+            scoped = scope_plan({'custom': [rule]}, verified=True, inactive_keys=set())
+            self.assertFalse(rule_expressible(rule), constraints)
+            self.assertEqual(scoped['port_allow'], {}, constraints)
+            self.assertEqual(scoped['net4_allow'], {}, constraints)
+            self.assertEqual(scoped['net6_allow'], {}, constraints)
+            self.assertFalse(custom_authorizes(
+                {'custom': [rule]}, kind='network', port=443, addr='10.0.0.5',
+                direction='outbound', active_keys={'closed.pem'},
+            ), constraints)
+
+        ports_only = validate_custom({
+            'name': 'web', 'type': 'network', 'mode': 'grant',
+            'constraints': {'ports': [443]},
+        })
+        plan = scope_plan({'custom': [ports_only]}, verified=True, inactive_keys=set())
+        self.assertEqual(plan['port_allow'].get(443), BIT['network'])
+        self.assertEqual(plan['net4_allow'], {})
+        self.assertTrue(custom_authorizes(
+            {'custom': [ports_only]}, kind='network', port=443, active_keys={'web.pem'},
+        ))
+        self.assertFalse(custom_authorizes(
+            {'custom': [ports_only]}, kind='network', port=80, active_keys={'web.pem'},
+        ))
+        self.assertEqual(connect_scope_bits(plan, '1.2.3.4', 443)[0] & BIT['network'], BIT['network'])
+        self.assertEqual(connect_scope_bits(plan, '8.8.8.8', 443)[0] & BIT['network'], BIT['network'])
+        self.assertEqual(connect_scope_bits(plan, '1.2.3.4', 22)[0] & BIT['network'], 0)
+        outbound = validate_custom({
+            'name': 'out', 'type': 'network', 'mode': 'grant',
+            'constraints': {'ports': [443], 'direction': 'outbound'},
+        })
+        self.assertTrue(rule_expressible(outbound))
+        self.assertTrue(custom_authorizes(
+            {'custom': [outbound]}, kind='network', port=443, direction='outbound',
+            active_keys={'out.pem'},
+        ))
+        self.assertFalse(custom_authorizes(
+            {'custom': [outbound]}, kind='network', port=443, active_keys={'out.pem'},
+        ))
+        plan = scope_plan({'custom': [outbound]}, verified=True, inactive_keys=set())
+        self.assertEqual(plan['port_allow'].get(443), BIT['network'])
+        v6 = validate_custom({
+            'name': 'v6', 'type': 'network', 'mode': 'grant',
+            'constraints': {'ports': [443], 'addrs': ['2001:db8::5']},
+        })
+        plan = scope_plan({'custom': [v6]}, verified=True, inactive_keys=set())
+        self.assertEqual(plan['port_allow'], {})
+        v6_key = (ipaddress.IPv6Address('2001:db8::5').packed, 443)
+        self.assertEqual(plan['net6_allow'].get(v6_key), BIT['network'])
+        self.assertEqual(connect_scope_bits(plan, '2001:db8::6', 443)[0], 0)
+        self.assertEqual(connect_scope_bits(plan, '2001:db8::5', 443)[0] & BIT['network'], BIT['network'])
+        src = (Path(__file__).resolve().parents[1] / 'python' / 'ker' / 'custom.py').read_text()
+        self.assertIn('any address', src)
+        bpf = (Path(__file__).resolve().parents[1] / 'src' / 'bpf' / 'ker.bpf.c').read_text()
+        self.assertIn('scope_net4', bpf)
+        self.assertIn('AF_UNIX', bpf)
+        self.assertIn('AF_NETLINK', bpf)
+
+    def test_login_grant_does_not_change_nonroot_exec(self):
+        from ker.enforce import BIT, bprm_denies, scope_plan, setuid_denies
+        from ker.hooks import merge_login_constraint
+        login = validate_custom({
+            'name': 'alice', 'type': 'login', 'mode': 'grant',
+            'constraints': {'users': ['alice'], 'uids': [1000]},
+        })
+        st = {'permissions': ['rootuser', 'rootsu', 'run'], 'custom': [login]}
+        plan = scope_plan(st, verified=True, inactive_keys=set())
+        self.assertNotIn(1000, plan['uid_allow'])
+        self.assertNotIn(1000, plan['uid_deny'])
+        self.assertEqual(plan['ino_allow'], {})
+        self.assertEqual(plan['uid_allow'].get(1000, 0) & (BIT['rootuser'] | BIT['rootsu']), 0)
+        mask = BIT['rootuser'] | BIT['rootsu'] | BIT['run']
+        common = dict(enforcement=True, media_ok=False, deny_mask_value=mask, allowed=False)
+        plain = bprm_denies(**common, uid=1000)
+        stuffed = bprm_denies(
+            **common, uid=1000, have_uid=True,
+            uid_allow=BIT['rootuser'] | BIT['rootsu'],
+            uid_deny=BIT['rootuser'] | BIT['rootsu'],
+        )
+        self.assertEqual(plain, stuffed)
+        self.assertTrue(plain)
+        # The root-login bit is not consulted for a non-root exec, so a
+        # login lock does not turn that exec into a denial by itself.
+        self.assertFalse(bprm_denies(
+            enforcement=True, media_ok=True, deny_mask_value=0, uid=1000,
+            allowed=False, have_uid=True, uid_deny=BIT['rootuser'] | BIT['rootsu'],
+        ))
+        self.assertFalse(setuid_denies(
+            enforcement=True, media_ok=False,
+            deny_mask_value=BIT['rootuser'] | BIT['rootsu'],
+            new_uid=1000, have_uid=True,
+            uid_allow=BIT['rootuser'] | BIT['rootsu'],
+        ))
+
+        root = validate_custom({
+            'name': 'rootlogin', 'type': 'login', 'mode': 'grant',
+            'constraints': {'uids': [0]},
+        })
+        plan0 = scope_plan(
+            {'permissions': ['rootuser', 'rootsu'], 'custom': [root]},
+            verified=True, inactive_keys=set(),
+        )
+        self.assertEqual(plan0['uid_allow'].get(0), BIT['rootuser'])
+        self.assertEqual(plan0['uid_allow'][0] & BIT['rootsu'], 0)
+        self.assertFalse(bprm_denies(
+            enforcement=True, media_ok=False, deny_mask_value=BIT['rootuser'],
+            uid=0, allowed=False, have_uid=True, uid_allow=BIT['rootuser'],
+        ))
+        self.assertTrue(bprm_denies(
+            enforcement=True, media_ok=False, deny_mask_value=BIT['rootuser'],
+            uid=0, allowed=False,
+        ))
+        # setuid-to-root still honors the login grant for BIT_ROOTUSER, and
+        # still denies when the privilege class itself is denied.
+        self.assertFalse(setuid_denies(
+            enforcement=True, media_ok=False, deny_mask_value=BIT['rootuser'],
+            new_uid=0, have_uid=True, uid_allow=BIT['rootuser'],
+        ))
+        self.assertTrue(setuid_denies(
+            enforcement=True, media_ok=False, deny_mask_value=BIT['rootsu'],
+            new_uid=0, have_uid=True, uid_allow=BIT['rootuser'],
+        ))
+        self.assertTrue(setuid_denies(
+            enforcement=True, media_ok=True, deny_mask_value=0,
+            new_uid=0, have_uid=True, uid_deny=BIT['rootuser'],
+        ))
+        self.assertTrue(bprm_denies(
+            enforcement=True, media_ok=True, deny_mask_value=0,
+            uid=0, allowed=False, have_uid=True, uid_deny=BIT['rootuser'],
+        ))
+
+        base = {'allow': True, 'block': False, 'mode': 'enforce'}
+        pam = {'custom': [login], 'kernel_enforcement': True, 'mode': 'enforce'}
+        alice = merge_login_constraint(base, 'alice', pam, active_keys={'alice.pem'})
+        self.assertFalse(alice['block'])
+        self.assertEqual(alice['custom_login'], 'allow')
+        denied = merge_login_constraint(dict(base), 'alice', pam, active_keys=set())
+        self.assertTrue(denied['block'])
+        bob = merge_login_constraint(dict(base), 'bob', pam, active_keys={'alice.pem'})
+        self.assertEqual(bob['custom_login'], 'not_governed')
+        self.assertFalse(bob['block'])
+
+    def test_replace_rule_still_narrows_when_media_ok(self):
+        import tempfile
+        from ker.enforce import BIT, decide_subject, scope_plan
+        with tempfile.TemporaryDirectory() as tmp:
+            tool = Path(tmp) / 'tool'
+            tool.write_text('x')
+            item = validate_custom({
+                'name': 'onlytool', 'type': 'command', 'mode': 'replace',
+                'constraints': {'paths': [str(tool)]},
+            })
+            plan = scope_plan(
+                {'permissions': ['run'], 'custom': [item]},
+                verified=True, inactive_keys=set(),
+            )
+        self.assertEqual(plan['narrow_mask'], BIT['run'])
+        self.assertTrue(decide_subject(
+            enforcement=True, media_ok=True, deny_mask_value=0,
+            bit=BIT['run'], allowed=False, narrow_mask=plan['narrow_mask'],
+        ))
+        self.assertTrue(decide_subject(
+            enforcement=True, media_ok=True, deny_mask_value=BIT['run'],
+            bit=BIT['run'], allowed=False, narrow_mask=BIT['run'],
+        ))
+        # Without the replace rule, media_ok leaves the deny mask unused.
+        self.assertFalse(decide_subject(
+            enforcement=True, media_ok=True, deny_mask_value=BIT['run'],
+            bit=BIT['run'], allowed=False, narrow_mask=0,
+        ))
+        src = (Path(__file__).resolve().parents[1] / 'src' / 'bpf' / 'ker.bpf.c').read_text()
+        self.assertIn('media_ok == 1 does not open a class that narrow_mask', src)
+        userspace = (Path(__file__).resolve().parents[1] / 'python' / 'ker' / 'enforce.py').read_text()
+        self.assertIn('media_ok == 1 does not', userspace)
+
 
 if __name__ == '__main__':
     unittest.main()
