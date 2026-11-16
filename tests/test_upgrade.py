@@ -146,6 +146,25 @@ class UpgradeTests(unittest.TestCase):
         }
         self.assertEqual(takeover_errors(st, target), [])
 
+    def test_published_0_1_compares_equal_to_0_1_0(self):
+        from ker import __version__
+        from ker.compat import manifest, takeover_errors, ver_cmp, ver_tuple
+        self.assertEqual(__version__, '0.1.0')
+        self.assertEqual(ver_tuple('0.1'), (0, 1, 0))
+        self.assertEqual(ver_tuple('0.1.0'), (0, 1, 0))
+        self.assertEqual(ver_cmp('0.1', '0.1.0'), 0)
+        self.assertLessEqual(ver_cmp('0.1', '0.1.0'), 0)
+        installed = {
+            'initialized': True,
+            'package_version': '0.1',
+            'state_schema': 1,
+            'media_schema': 2,
+            'crypto_epoch': 1,
+        }
+        self.assertEqual(takeover_errors(installed, manifest()), [])
+        unreleased = dict(installed, package_version='0.4.2')
+        self.assertEqual(takeover_errors(unreleased, manifest()), [])
+
     def test_snapshot_and_rollback(self):
         self._legacy_state()
         from ker.state import save_state, state

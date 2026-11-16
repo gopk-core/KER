@@ -22,8 +22,8 @@ die() { echo "vm-test: $*" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || die "need root"
 [ -f "$KERNEL" ] || die "missing host kernel $KERNEL"
 [ -d "$ROOTFS" ] || die "missing rootfs $ROOTFS (run debootstrap first)"
-[ -f "$ROOT/dist/bpf/ker.bpf.o" ] || { make -C "$ROOT" bpf; }
-[ -f "$ROOT/dist/ker-probe" ] || make -C "$ROOT" probe
+[ -f "$ROOT/dist/bpf/amd64/ker.bpf.o" ] || { make -C "$ROOT" bpf; }
+[ -x "$ROOT/dist/probe/amd64/ker-probe" ] || make -C "$ROOT" probe
 
 # Build the current amd64 package only (do not dpkg -i on the host).
 make -C "$ROOT" bpf probe
@@ -121,25 +121,32 @@ for mp in "$ROOTFS/dev/pts" "$ROOTFS/dev" "$ROOTFS/proc" "$ROOTFS/sys" "$ROOTFS/
   mountpoint -q "$mp" && umount -l "$mp" || true
 done
 
-# Install the deb into the rootfs (still not the host).
+# Install the deb into the guest rootfs only. Never dpkg -i on the host.
+case "$ROOTFS" in
+  "$DIST"/*) ;;
+  *) die "refusing to install into unexpected root $ROOTFS" ;;
+esac
+[ "$ROOTFS" != "/" ] || die "refusing to install into /"
 cp -a "$DEB" "$ROOT/scripts/vm-selftest.sh" "$ROOTFS/tmp/"
 mount -t proc proc "$ROOTFS/proc"
 mount --bind /dev "$ROOTFS/dev"
 # Drop a previous half-installed guest package so the new payload is clean.
+# KER_SKIP_SYSTEMD / a cleared host-BPF flag stop the chrooted postinst from
+# talking to the build machine's systemd or loading BPF here.
 chroot "$ROOTFS" dpkg --purge --force-all ker >/dev/null 2>&1 || true
 rm -rf "$ROOTFS/usr/lib/ker"
-# skip running apt/dpkg triggers that need a full systemd
-chroot "$ROOTFS" dpkg -i --force-depends /tmp/$(basename "$DEB") || \
+env -u KER_ALLOW_HOST_BPF -u KER_IN_VM KER_SKIP_SYSTEMD=1 \
+  chroot "$ROOTFS" dpkg -i --force-depends /tmp/$(basename "$DEB") || \
   die "dpkg -i of the guest package failed"
 install -d -m 755 "$ROOTFS/usr/lib/ker"
 install -m 755 "$ROOTFS/tmp/vm-selftest.sh" "$ROOTFS/usr/lib/ker/vm-selftest.sh"
 # If the package missed the bpf object or probe, copy from the host build.
 if [ ! -f "$ROOTFS/usr/lib/ker/bpf/ker.bpf.o" ]; then
   install -d -m 755 "$ROOTFS/usr/lib/ker/bpf"
-  install -m 644 "$ROOT/dist/bpf/ker.bpf.o" "$ROOTFS/usr/lib/ker/bpf/ker.bpf.o"
+  install -m 644 "$ROOT/dist/bpf/amd64/ker.bpf.o" "$ROOTFS/usr/lib/ker/bpf/ker.bpf.o"
 fi
 if [ ! -x "$ROOTFS/usr/lib/ker/ker-probe" ]; then
-  install -m 755 "$ROOT/dist/ker-probe" "$ROOTFS/usr/lib/ker/ker-probe"
+  install -m 755 "$ROOT/dist/probe/amd64/ker-probe" "$ROOTFS/usr/lib/ker/ker-probe"
 fi
 # hostname + fstab
 echo ker-vm > "$ROOTFS/etc/hostname"

@@ -45,6 +45,7 @@ def main(argv: list[str] | None = None) -> int:
     p_add.add_argument('--token', help='signed join token from the master')
     p_add.add_argument('--name')
     p_add.add_argument('--yes', action='store_true')
+    p_add.add_argument('--fingerprint', help='out-of-band GPG fingerprint or kernel cert sha256 of the master trust anchor')
     p_srv = sub.add_parser('serve', help='run master sync listener or child poll loop')
     p_srv.add_argument('--child', action='store_true')
     p_srv.add_argument('--host', default='0.0.0.0')
@@ -125,7 +126,7 @@ def main(argv: list[str] | None = None) -> int:
         uninstall_run(lang, yes=getattr(args, 'yes', False))
         return 0
     if args.cmd == 'addnet':
-        addnet(lang if (args.language or args.yes) else None, master=args.master, token=args.token, yes=args.yes, name=args.name)
+        addnet(lang if (args.language or args.yes) else None, master=args.master, token=args.token, yes=args.yes, name=args.name, fingerprint=getattr(args, 'fingerprint', None))
         return 0
     if args.cmd == 'serve':
         from ker.cluster import run_serve

@@ -34,10 +34,10 @@ def sign_message(obj: dict, keys: dict) -> dict:
     return {'payload': b64(raw), 'gsig': b64(gsig), 'ksig': b64(ksig)}
 
 
-def verify_message(msg: dict, keys: dict) -> dict:
+def verify_message(msg: dict, keys: dict, *, keyring=None, cert=None) -> dict:
     try:
         raw = b64d(msg['payload'])
-        verify_bytes(raw, b64d(msg['gsig']), b64d(msg['ksig']), keys)
+        verify_bytes(raw, b64d(msg['gsig']), b64d(msg['ksig']), keys, keyring=keyring, cert=cert)
     except Exception as e:
         raise ProtocolError('SIGNATURE_REJECTED') from e
     return json.loads(raw.decode('utf-8'))

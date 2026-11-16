@@ -15,7 +15,7 @@ ARCHES = ['amd64', 'arm64', 'armhf', 'i386', 'riscv64']
 class PackagingTests(unittest.TestCase):
     def test_version_is_0_1(self):
         import ker
-        self.assertEqual(ker.__version__, '0.1')
+        self.assertEqual(ker.__version__, '0.1.0')
 
     def test_arch_map_covers_matrix(self):
         meta = json.loads((ROOT / 'packaging' / 'arches.json').read_text())

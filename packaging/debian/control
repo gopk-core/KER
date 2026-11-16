@@ -1,5 +1,5 @@
 Package: ker
-Version: 0.1
+Version: 0.1.0
 Section: admin
 Priority: optional
 Architecture: amd64

@@ -1,6 +1,6 @@
 # Building KER packages
 
-KER 0.1 ships architecture-specific packages in four formats. Python code is
+KER 0.1.0 ships architecture-specific packages in four formats. Python code is
 the same on every architecture; each package also contains a BPF object and a
 statically linked `ker-probe` built for that architecture.
 
@@ -17,12 +17,12 @@ Do not install a newly built package on the production host that already runs
 | i386     | i386          | i686       | x86           | i686                |
 | riscv64  | riscv64       | riscv64    | riscv64       | riscv64             |
 
-Example artifact names for version 0.1:
+Example artifact names for version 0.1.0:
 
-- `dist/ker_0.1_amd64.deb`
-- `dist/ker-0.1-1.x86_64.rpm`
-- `dist/ker-0.1-r0.x86_64.apk`
-- `dist/ker-0.1-1-x86_64.pkg.tar.zst`
+- `dist/ker_0.1.0_amd64.deb`
+- `dist/ker-0.1.0-1.x86_64.rpm`
+- `dist/ker-0.1.0-r0.x86_64.apk`
+- `dist/ker-0.1.0-1-x86_64.pkg.tar.zst`
 
 ## Build
 
@@ -49,9 +49,26 @@ and the other `*-linux-gnu` toolchains) plus `clang` (BPF) and `rpmbuild`
 (for RPMs) are required on the build machine. `packaging/arches.json` lists
 the compiler and architecture names.
 
-Unsigned packages still need `--trust-package` when upgrading with `ker
-upgrade`, just as in 0.3. Alpine also needs `apk add --allow-untrusted` if
-you install the `.apk` directly.
+## Release signatures
+
+`packaging/release.gpg` is a public OpenPGP key. `packaging/stage.sh` installs it to `/usr/lib/ker/release-keys/release.gpg`. The private key is not in git, and this repository does not contain a passphrase or a secret keyring.
+
+The public key currently in the tree (fingerprint `AB264D24E538B7DC0E449FC16EE0524231372B31`) was generated so the file format and the install path are real. Its private half was not retained. Before you publish signed packages, replace `packaging/release.gpg` with the public key that matches the offline private key you will actually sign with, and tell operators that fingerprint out of band. Until then, `gpgv` against the shipped key will not verify signatures from any other key.
+
+Create the key on a machine you keep offline:
+
+```
+export KER_RELEASE_GNUPGHOME=/path/outside/this/repo
+mkdir -m 700 "$KER_RELEASE_GNUPGHOME"
+gpg --batch --pinentry-mode loopback --passphrase '' \
+  --homedir "$KER_RELEASE_GNUPGHOME" \
+  --quick-gen-key 'KER Release <ker-release@localhost>' rsa3072 sign 0
+gpg --homedir "$KER_RELEASE_GNUPGHOME" --export --output packaging/release.gpg
+```
+
+Keep `$KER_RELEASE_GNUPGHOME` offline. Commit only the exported public key. When that directory is set and contains a secret key, `packaging/sign-dist.sh` (also run at the end of `packaging/build-all.sh`) writes `<artifact>.sig` next to each package. The script refuses a keyring path inside the source tree. If the variable is unset, the build still succeeds and the packages are unsigned.
+
+`ker upgrade` verifies `<file>.sig` with the installed public key. No `.sig` means the package is unsigned and `--trust-package` is required. A bad signature is rejected even if `--trust-package` is set. Alpine still needs `apk add --allow-untrusted` when you install an unsigned `.apk` directly; a signature KER understands is the detached `.sig` next to the package, not an Alpine package signature.
 
 After install, `ker` is in `/usr/sbin`, which is on root's `PATH`. First run
 is `ker`.

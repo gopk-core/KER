@@ -117,10 +117,22 @@ def _trust_blob() -> dict:
 def _write_trust(blob: dict) -> None:
     TRUST_DIR.mkdir(parents=True, exist_ok=True)
     os.chmod(TRUST_DIR, 0o700)
-    (TRUST_DIR / 'media.gpg').write_bytes(b64d(blob['media_gpg']))
-    (TRUST_DIR / 'kernel-cert.pem').write_bytes(b64d(blob['kernel_cert']))
-    os.chmod(TRUST_DIR / 'media.gpg', 0o400)
-    os.chmod(TRUST_DIR / 'kernel-cert.pem', 0o400)
+    payloads = {
+        'media.gpg': b64d(blob['media_gpg']),
+        'kernel-cert.pem': b64d(blob['kernel_cert']),
+    }
+    for name, data in payloads.items():
+        path = TRUST_DIR / name
+        # A previous anchor is mode 0400. Unlink it so a confirmed replacement
+        # can be written by the owner, who cannot open a 0400 file for write.
+        if path.exists():
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+            path.unlink()
+        path.write_bytes(data)
+        os.chmod(path, 0o400)
 
 
 def create_join_token(master_host: str, port: int = DEFAULT_PORT, name: str | None = None) -> str:
@@ -160,7 +172,8 @@ def parse_join_token(token: str, keys: dict) -> dict:
 
 
 def addnet(lang: str | None = None, *, master: str | None = None,
-           token: str | None = None, yes: bool = False, name: str | None = None) -> dict:
+           token: str | None = None, yes: bool = False, name: str | None = None,
+           fingerprint: str | None = None) -> dict:
     if not lang:
         try:
             lang = load_state().get('lang')
@@ -176,8 +189,10 @@ def addnet(lang: str | None = None, *, master: str | None = None,
         master = ask('master host[:port]')
     if not token:
         token = ask('join token').strip()
+    if not fingerprint and not yes:
+        fingerprint = ask('trust fingerprint (out of band, not from the token text)').strip()
     host, port = _split_host(master)
-    return join_master(host, port, token, name=name)
+    return join_master(host, port, token, name=name, confirm_fingerprint=fingerprint or None)
 
 
 def _split_host(master: str) -> tuple[str, int]:
@@ -192,35 +207,222 @@ def _split_host(master: str) -> tuple[str, int]:
     return master, DEFAULT_PORT
 
 
-def bootstrap_from_token(token: str) -> dict:
-    """Install the master's public trust from the token, then verify its signature."""
+def _norm_fp(value: str | None) -> str:
+    return ''.join((value or '').split()).upper()
+
+
+def _fingerprint_keyring(blob: bytes) -> str:
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix='ker-fpr-') as tmp:
+        ring = Path(tmp) / 'pub.gpg'
+        ring.write_bytes(blob)
+        r = subprocess_run_gpg(ring)
+    return r
+
+
+def subprocess_run_gpg(ring: Path) -> str:
+    import subprocess
+    r = subprocess.run(
+        ['gpg', '--batch', '--show-keys', '--with-colons', str(ring)],
+        capture_output=True, text=True, timeout=20,
+    )
+    if r.returncode:
+        raise ClusterError('trust anchor is not a public keyring')
+    for line in r.stdout.splitlines():
+        if line.startswith('fpr:'):
+            return line.split(':')[9]
+    raise ClusterError('trust anchor has no fingerprint')
+
+
+def _trust_identities(blob: dict) -> tuple[bytes, bytes, str, str]:
+    """Return (keyring, cert, computed fingerprint, computed cert sha256)."""
+    import hashlib
+    try:
+        keyring = b64d(blob['media_gpg'])
+        cert = b64d(blob['kernel_cert'])
+    except Exception as e:
+        raise ClusterError('join token trust anchor is malformed') from e
+    if not keyring or not cert:
+        raise ClusterError('join token trust anchor is empty')
+    fpr = _fingerprint_keyring(keyring)
+    sha = hashlib.sha256(cert).hexdigest()
+    return keyring, cert, fpr, sha
+
+
+def _existing_trust_files() -> tuple[Path, Path] | None:
+    gpg = TRUST_DIR / 'media.gpg'
+    cert = TRUST_DIR / 'kernel-cert.pem'
+    if gpg.is_file() and cert.is_file() and gpg.stat().st_size and cert.stat().st_size:
+        return gpg, cert
+    return None
+
+
+def _peek_token(token: str) -> tuple[dict, dict]:
     try:
         msg = json.loads(b64d(token).decode('utf-8'))
         peek = json.loads(b64d(msg['payload']).decode('utf-8'))
     except Exception as e:
         raise ClusterError('invalid join token') from e
-    if not peek.get('trust'):
+    if not isinstance(peek, dict) or not peek.get('trust'):
         raise ClusterError('join token missing trust anchors')
-    ensure_dirs()
-    _write_trust(peek['trust'])
+    return msg, peek
+
+
+def trust_matches_tree(keyring: bytes, cert: bytes, media_dir: Path) -> bool:
+    """True when this public trust verifies bundle.json in an already-mounted tree."""
+    import subprocess
+    import tempfile
+    bundle = media_dir / 'bundle.json'
+    sig = media_dir / 'bundle.json.sig'
+    ksig = media_dir / 'bundle.json.ksig'
+    if not bundle.is_file() or not sig.is_file() or not ksig.is_file():
+        return False
+    with tempfile.TemporaryDirectory(prefix='ker-media-trust-') as tmp:
+        ring = Path(tmp) / 'media.gpg'
+        crt = Path(tmp) / 'cert.pem'
+        pub = Path(tmp) / 'pub.pem'
+        ring.write_bytes(keyring)
+        crt.write_bytes(cert)
+        gpg = subprocess.run(
+            ['gpgv', '--keyring', str(ring), str(sig), str(bundle)],
+            capture_output=True, text=True, timeout=20,
+        )
+        if gpg.returncode:
+            return False
+        extracted = subprocess.run(
+            ['openssl', 'x509', '-in', str(crt), '-pubkey', '-noout', '-out', str(pub)],
+            capture_output=True, text=True, timeout=20,
+        )
+        if extracted.returncode:
+            return False
+        rsa = subprocess.run(
+            ['openssl', 'dgst', '-sha256', '-verify', str(pub), '-signature', str(ksig), str(bundle)],
+            capture_output=True, text=True, timeout=20,
+        )
+        return rsa.returncode == 0
+
+
+def _installed_media_matches(keyring: bytes, cert: bytes, st: dict | None = None) -> bool:
+    """Out-of-band check: the token trust verifies a present root or admin medium."""
+    from ker.devices import resolve_media_path
+    from ker.testmode import _mount_ro, _umount
+    from ker.paths import MOUNT_ROOT
+    st = st or load_state()
+    checked = False
+    for i, medium in enumerate(st.get('media') or []):
+        if not isinstance(medium, dict):
+            continue
+        keys = medium.get('keys') or []
+        role = medium.get('role') or ''
+        if 'root.pem' not in keys and 'admin.pem' not in keys and role not in ('root', 'admin', 'root+admin'):
+            continue
+        live = resolve_media_path(medium)
+        if not live:
+            continue
+        dest = MOUNT_ROOT / f'join{i}'
+        try:
+            _mount_ro(live, dest)
+        except Exception:
+            continue
+        try:
+            checked = True
+            if trust_matches_tree(keyring, cert, dest):
+                return True
+        finally:
+            _umount(dest)
+    return False if checked else False
+
+
+def _confirm_matches(confirm: str | None, fpr: str, sha: str) -> bool:
+    want = _norm_fp(confirm)
+    if not want:
+        return False
+    return want == _norm_fp(fpr) or want == _norm_fp(sha)
+
+
+def bootstrap_from_token(token: str, *, confirm_fingerprint: str | None = None,
+                         state: dict | None = None) -> dict:
+    """Accept a join token only after an out-of-band trust check.
+
+    The token's trust blob is not installed and then used to verify itself.
+    A new anchor is written only when one of these is true:
+
+    - the operator confirms the fingerprint (or certificate sha256) out of band
+    - the node already has that trust anchor and it verifies the token
+    - a present root or admin medium verifies under the token's public keys
+
+    The first join still works: pass the fingerprint copied from the master
+    over a channel that is not the token string.
+    """
+    msg, peek = _peek_token(token)
+    _keyring, _cert, fpr, sha = _trust_identities(peek['trust'])
+    if _norm_fp(peek.get('gpg_fingerprint')) != _norm_fp(fpr):
+        raise ClusterError('join token fingerprint does not match its trust blob')
+    if _norm_fp(peek.get('kernel_cert_sha256')) != _norm_fp(sha):
+        raise ClusterError('join token certificate hash does not match its trust blob')
+
+    existing = _existing_trust_files()
     keys = {
-        'gpg_fingerprint': peek.get('gpg_fingerprint'),
+        'gpg_fingerprint': fpr,
         'gpg_home': str(PRIVATE_DIR / 'gnupg'),
         'rsa_key': str(PRIVATE_DIR / 'kernel-signing.key'),
         'rsa_pub': str(TRUST_DIR / 'kernel-cert.pem'),
     }
-    body = verify_message(msg, keys)
+    if existing is not None:
+        try:
+            body = verify_message(msg, keys, keyring=existing[0], cert=existing[1])
+        except Exception:
+            body = None
+        if body is not None:
+            if body.get('type') != 'join-token':
+                raise ClusterError('invalid join token type')
+            # Already-installed trust verified the token. Do not replace it
+            # with whatever trust bytes the token carried.
+            return body
+
+    confirmed = _confirm_matches(confirm_fingerprint, fpr, sha)
+    media_ok = False
+    if not confirmed:
+        media_ok = _installed_media_matches(_keyring, _cert, state)
+    if not confirmed and not media_ok:
+        raise ClusterError(
+            'refusing to install a trust anchor without out-of-band fingerprint '
+            'confirmation or a matching root/admin medium'
+        )
+
+    # Verify against the candidate files before anything is installed.
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix='ker-join-trust-') as tmp:
+        ring = Path(tmp) / 'media.gpg'
+        crt = Path(tmp) / 'kernel-cert.pem'
+        ring.write_bytes(_keyring)
+        crt.write_bytes(_cert)
+        try:
+            body = verify_message(msg, keys, keyring=ring, cert=crt)
+        except Exception as e:
+            raise ClusterError('invalid join token') from e
     if body.get('type') != 'join-token':
         raise ClusterError('invalid join token type')
+    ensure_dirs()
+    previous = None
+    if existing is not None:
+        previous = (existing[0].read_bytes(), existing[1].read_bytes())
+    try:
+        _write_trust(peek['trust'])
+    except Exception:
+        if previous is not None:
+            _write_trust({'media_gpg': b64(previous[0]), 'kernel_cert': b64(previous[1])})
+        raise
     return body
 
 
-def join_master(host: str, port: int, token: str, name: str | None = None) -> dict:
+def join_master(host: str, port: int, token: str, name: str | None = None,
+                *, confirm_fingerprint: str | None = None) -> dict:
     ensure_dirs()
     st = load_state()
     if st.get('initialized') and st.get('role') == 'master':
         raise ClusterError('this host is already a master; it will not mint or replace root.pem via addnet')
-    token_body = bootstrap_from_token(token)
+    token_body = bootstrap_from_token(token, confirm_fingerprint=confirm_fingerprint, state=st)
     if host != token_body.get('master') or int(port) != int(token_body.get('port') or port):
         # allow the caller-supplied address if the token listed it; otherwise keep the token's address
         if not host:
@@ -237,6 +439,11 @@ def join_master(host: str, port: int, token: str, name: str | None = None) -> di
         body = reply['body']
         trust = reply['trust']
         secret = b64d(reply['secret'])
+        # The welcome frame is not signed. Only install trust that matches the
+        # anchor already confirmed while checking the join token.
+        _wkr, _wcert, wfpr, wsha = _trust_identities(trust)
+        if _norm_fp(wfpr) != _norm_fp(token_body.get('gpg_fingerprint')) or _norm_fp(wsha) != _norm_fp(token_body.get('kernel_cert_sha256')):
+            raise ClusterError('master welcome trust does not match the confirmed anchor')
         _write_trust(trust)
         child = {
             'initialized': True,

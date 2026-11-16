@@ -43,6 +43,10 @@ PROBE="$ROOT/dist/probe/$ARCH/ker-probe"
 [ -f "$BPF" ] || { echo "missing $BPF (run packaging/build-bpf.sh)" >&2; exit 1; }
 [ -x "$PROBE" ] || { echo "missing $PROBE (run packaging/build-probe.sh)" >&2; exit 1; }
 install -m 644 "$BPF" "$DEST/usr/lib/ker/bpf/ker.bpf.o"
+if [ -f "$ROOT/packaging/release.gpg" ]; then
+  install -d -m 755 "$DEST/usr/lib/ker/release-keys"
+  install -m 644 "$ROOT/packaging/release.gpg" "$DEST/usr/lib/ker/release-keys/release.gpg"
+fi
 install -m 755 "$PROBE" "$DEST/usr/lib/ker/ker-probe"
 printf '%s\n' "$ARCH" > "$DEST/usr/lib/ker/arch"
 chmod 644 "$DEST/usr/lib/ker/arch"
