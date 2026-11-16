@@ -1,5 +1,9 @@
 # KER
 
+<p align="center">
+  <img src="docs/logo.png" alt="KER" width="160" height="160">
+</p>
+
 一个 Linux 内核级授权系统：把经过签名的密钥放在可移动介质上，在终端里完成安装与管理。没有图形界面。
 
 [English](README_EN.md)

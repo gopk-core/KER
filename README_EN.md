@@ -1,5 +1,9 @@
 # KER
 
+<p align="center">
+  <img src="docs/logo.png" alt="KER" width="160" height="160">
+</p>
+
 A Linux kernel-level authorization system. Signed keys live on removable media; installation and administration happen in the terminal. There is no graphical interface.
 
 [简体中文](README.md)
