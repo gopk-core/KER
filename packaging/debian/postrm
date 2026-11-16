@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+case "$1" in
+  purge)
+    echo "KER package purged; keys and state in /etc/ker and /var/lib/ker were left untouched." >&2
+    echo "For a full wipe, run 'ker uninstall' before purging, or remove those directories yourself." >&2
+    ;;
+esac
+exit 0

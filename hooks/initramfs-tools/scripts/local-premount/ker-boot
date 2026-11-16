@@ -1,0 +1,97 @@
+#!/bin/sh
+# initramfs-tools local-premount: consult boot.pem before the real root is used.
+# Terminal / console only. Fail closed when boot authorization is required and
+# verification fails in enforcement mode, or when the checker itself crashes
+# while boot-required is set and the recorded mode is enforce.
+prereqs() { echo ''; }
+case "${1:-}" in prereqs) prereqs; exit 0;; esac
+
+# If KER was never initialized when this image was built, do not block boot.
+if [ ! -f /etc/ker/state.json ]; then
+  exit 0
+fi
+
+logc() {
+  printf '%s\n' "$*" > /dev/console 2>/dev/null || printf '%s\n' "$*"
+}
+
+# Filesystem label of the optional self-test result volume.
+# Never fall back to a generic /dev/sdX or /dev/vdX: those may be
+# authorization media, and extra files fail the exact-set verify.
+RESULT_LABEL=KERRESULT
+
+fs_label() {
+  dev=$1
+  if command -v blkid >/dev/null 2>&1; then
+    blkid -o value -s LABEL "$dev" 2>/dev/null || true
+  elif command -v lsblk >/dev/null 2>&1; then
+    lsblk -no LABEL "$dev" 2>/dev/null || true
+  fi
+}
+
+find_result_dev() {
+  if [ -e /dev/disk/by-label/"$RESULT_LABEL" ]; then
+    printf '%s\n' /dev/disk/by-label/"$RESULT_LABEL"
+    return 0
+  fi
+  # No udev in some early environments; identify the volume by label only.
+  for dev in /dev/disk/by-label/* /dev/vd[a-z] /dev/vd[a-z][0-9] /dev/sd[a-z] /dev/sd[a-z][0-9]; do
+    [ -b "$dev" ] || continue
+    label=$(fs_label "$dev")
+    if [ "$label" = "$RESULT_LABEL" ]; then
+      printf '%s\n' "$dev"
+      return 0
+    fi
+  done
+  return 1
+}
+
+write_status() {
+  mkdir -p /run/ker 2>/dev/null || true
+  printf '%s\n' "$1" > /run/ker/boot-status.json 2>/dev/null || true
+  dev=$(find_result_dev) || return 0
+  mkdir -p /run/ker-result 2>/dev/null || true
+  if mount -o rw "$dev" /run/ker-result 2>>/run/ker/boot-check.err; then
+    cp -f /run/ker/boot-status.json /run/ker-result/boot-hook.json 2>/dev/null || true
+    # Keep checker logs and any mount helper failures on the result volume.
+    if [ -f /run/ker/mount.err ]; then
+      cat /run/ker/mount.err >> /run/ker/boot-check.err 2>/dev/null || true
+    fi
+    cp -f /run/ker/boot-check.err /run/ker-result/boot-check.err 2>/dev/null || true
+    cp -f /run/ker/mount.err /run/ker-result/mount.err 2>/dev/null || true
+    umount /run/ker-result 2>/dev/null || true
+  fi
+}
+
+export PATH="/bin:/sbin:/usr/bin:/usr/sbin"
+export PYTHONPATH="/usr/lib/ker${PYTHONPATH:+:$PYTHONPATH}"
+mkdir -p /run/ker 2>/dev/null || true
+
+rc=0
+json=$(/usr/bin/python3 /usr/lib/ker/ker-boot-check 2>/run/ker/boot-check.err) || rc=$?
+if [ -z "$json" ]; then
+  json='{"allow":false,"block":true,"reason":"CHECKER_FAILED","mode":"unknown"}'
+  [ "$rc" -eq 0 ] && rc=99
+fi
+write_status "$json"
+logc "KER boot hook: $json"
+
+required=0
+if [ -f /etc/ker/boot-required ] && grep -qx required /etc/ker/boot-required; then
+  required=1
+fi
+mode=$(printf '%s\n' "$json" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin).get("mode") or "")' 2>/dev/null || true)
+block=$(printf '%s\n' "$json" | /usr/bin/python3 -c 'import json,sys; print("yes" if json.load(sys.stdin).get("block") else "no")' 2>/dev/null || echo yes)
+
+if [ "$block" = "yes" ] || { [ "$required" = 1 ] && [ "$mode" = "enforce" ] && [ "$rc" -ne 0 ]; }; then
+  logc "KER: boot authorization failed; refusing to continue to the real root"
+  write_status "$json"
+  if command -v poweroff >/dev/null 2>&1; then
+    poweroff -f
+  fi
+  if command -v reboot >/dev/null 2>&1; then
+    reboot -f
+  fi
+  while :; do sleep 60; done
+fi
+exit 0

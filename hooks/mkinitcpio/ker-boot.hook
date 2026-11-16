@@ -1,0 +1,16 @@
+#!/usr/bin/ash
+# /usr/lib/initcpio/hooks/ker-boot
+run_hook() {
+  [ -f /etc/ker/state.json ] || return 0
+  export PYTHONPATH="/usr/lib/ker${PYTHONPATH:+:$PYTHONPATH}"
+  mkdir -p /run/ker
+  json=$(python3 /usr/lib/ker/ker-boot-check 2>/run/ker/boot-check.err) || true
+  [ -n "$json" ] || json='{"allow":false,"block":true,"reason":"CHECKER_FAILED","mode":"unknown"}'
+  printf '%s\n' "$json" > /run/ker/boot-status.json
+  echo "KER boot hook: $json"
+  block=$(printf '%s\n' "$json" | python3 -c 'import json,sys; print("yes" if json.load(sys.stdin).get("block") else "no")' 2>/dev/null || echo yes)
+  if [ "$block" = "yes" ]; then
+    echo "KER: boot authorization failed; refusing to continue to the real root"
+    poweroff -f 2>/dev/null || reboot -f 2>/dev/null || while :; do sleep 60; done
+  fi
+}

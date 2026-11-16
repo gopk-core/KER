@@ -1,0 +1,29 @@
+#!/bin/sh
+set -e
+# Snapshot host state before the new package unpacks. Works even if the
+# previous package did not yet ship `ker upgrade`. Never touches media.
+case "$1" in
+  install|upgrade)
+    if [ ! -e /etc/ker/state.json ]; then
+      exit 0
+    fi
+    TS=$(date -u +%Y%m%dT%H%M%SZ)
+    DEST=/var/lib/ker/upgrade/snapshots/preinst-$TS
+    mkdir -p "$DEST"
+    chmod 700 /var/lib/ker /var/lib/ker/upgrade /var/lib/ker/upgrade/snapshots "$DEST" 2>/dev/null || true
+    cp -a /etc/ker/state.json "$DEST/state.json"
+    if [ -f /etc/ker/config.json ]; then
+      cp -a /etc/ker/config.json "$DEST/config.json"
+    fi
+    if [ -d /etc/ker/trust ]; then
+      cp -a /etc/ker/trust "$DEST/trust"
+    fi
+    if [ -d /var/lib/ker/private ]; then
+      cp -a /var/lib/ker/private "$DEST/private"
+    fi
+    printf '{"reason":"preinst","created":"%s"}
+' "$TS" > "$DEST/meta.json"
+    chmod 700 "$DEST"
+    ;;
+esac
+exit 0

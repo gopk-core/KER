@@ -1,0 +1,5 @@
+# KER-SSH-HOOK-BEGIN
+# Account-phase gate for both password and public-key SSH logins (UsePAM yes).
+# The helper allows in test mode and when the ssh permission is not selected.
+account required pam_exec.so quiet /usr/lib/ker/ker-ssh-pam
+# KER-SSH-HOOK-END

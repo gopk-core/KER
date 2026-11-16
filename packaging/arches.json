@@ -1,0 +1,47 @@
+{
+  "amd64": {
+    "deb": "amd64",
+    "rpm": "x86_64",
+    "apk": "x86_64",
+    "arch": "x86_64",
+    "bpf_target": "x86",
+    "cc": "gcc",
+    "triplet": "x86_64-linux-gnu"
+  },
+  "arm64": {
+    "deb": "arm64",
+    "rpm": "aarch64",
+    "apk": "aarch64",
+    "arch": "aarch64",
+    "bpf_target": "arm64",
+    "cc": "aarch64-linux-gnu-gcc",
+    "triplet": "aarch64-linux-gnu"
+  },
+  "armhf": {
+    "deb": "armhf",
+    "rpm": "armv7hl",
+    "apk": "armv7",
+    "arch": "armv7h",
+    "bpf_target": "arm",
+    "cc": "arm-linux-gnueabihf-gcc",
+    "triplet": "arm-linux-gnueabihf"
+  },
+  "i386": {
+    "deb": "i386",
+    "rpm": "i686",
+    "apk": "x86",
+    "arch": "i686",
+    "bpf_target": "x86",
+    "cc": "i686-linux-gnu-gcc",
+    "triplet": "i686-linux-gnu"
+  },
+  "riscv64": {
+    "deb": "riscv64",
+    "rpm": "riscv64",
+    "apk": "riscv64",
+    "arch": "riscv64",
+    "bpf_target": "riscv",
+    "cc": "riscv64-linux-gnu-gcc",
+    "triplet": "riscv64-linux-gnu"
+  }
+}

@@ -1,0 +1,16 @@
+[Unit]
+Description=KER cluster sync (master listener or child poll)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/ker/state.json
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/ker serve
+Restart=on-failure
+RestartSec=3
+UMask=0077
+# Do not start automatically on package install; enable after first init.
+
+[Install]
+WantedBy=multi-user.target

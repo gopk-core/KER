@@ -1,0 +1,9 @@
+[Unit]
+Description=KER immediate media presence check
+ConditionPathExists=/etc/ker/state.json
+# Triggered by udev on block add/remove. Cheap and fail-closed; does not mount
+# when a required medium is missing.
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/ker enforce --presence

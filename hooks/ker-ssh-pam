@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+import sys
+from pathlib import Path
+for cand in (
+    Path('/usr/lib/ker'),
+    Path(__file__).resolve().parent,
+    Path(__file__).resolve().parents[1] / 'python',
+):
+    if (cand / 'ker' / '__init__.py').exists():
+        sys.path.insert(0, str(cand))
+        break
+
+"""pam_exec entrypoint. Exit 0 to allow, 1 to deny. Never throws out of main."""
+import os
+from ker.hooks import authorize, log_decision
+
+def main():
+    user = os.environ.get('PAM_USER') or ''
+    service = os.environ.get('PAM_SERVICE') or ''
+    pam_type = os.environ.get('PAM_TYPE') or ''
+    decision = authorize('ssh', scan=True)
+    decision['pam_user'] = user
+    decision['pam_service'] = service
+    decision['pam_type'] = pam_type
+    log_decision(decision, tag='ker-ssh')
+    return 1 if decision.get('block') else 0
+
+if __name__ == '__main__':
+    try:
+        raise SystemExit(main())
+    except SystemExit:
+        raise
+    except Exception as e:
+        # Fail closed only when we can prove enforcement; otherwise do not lock out.
+        try:
+            from ker.hooks import enforcement_enabled, permission_selected
+            from ker.state import state
+            st = state()
+            if st.get('initialized') and permission_selected(st, 'ssh') and enforcement_enabled(st):
+                print(f'ker-ssh-pam internal error (deny): {e}', file=sys.stderr)
+                raise SystemExit(1)
+        except SystemExit:
+            raise
+        except Exception:
+            pass
+        print(f'ker-ssh-pam internal error (allow): {e}', file=sys.stderr)
+        raise SystemExit(0)

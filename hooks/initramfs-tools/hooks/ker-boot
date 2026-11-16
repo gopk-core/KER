@@ -1,0 +1,104 @@
+#!/bin/sh
+# initramfs-tools hook: copy the KER boot checker, crypto tools and trust anchors.
+# STAGING in the package; installed under /usr/share/initramfs-tools/hooks/.
+set -eu
+prereqs() { echo ''; }
+case "${1:-}" in prereqs) prereqs; exit 0;; esac
+
+if [ -f /usr/share/initramfs-tools/hook-functions ]; then
+  . /usr/share/initramfs-tools/hook-functions
+else
+  exit 0
+fi
+
+copy_exec_if() {
+  if [ -x "$1" ]; then
+    copy_exec "$1"
+  fi
+}
+
+copy_exec_if /usr/bin/python3
+copy_exec_if /usr/bin/gpgv
+copy_exec_if /usr/bin/openssl
+copy_exec_if /usr/bin/gpg
+copy_exec_if /usr/lib/ker/ker-boot-check
+copy_exec_if /bin/mount
+copy_exec_if /usr/bin/mount
+copy_exec_if /bin/umount
+copy_exec_if /usr/bin/umount
+copy_exec_if /usr/bin/env
+copy_exec_if /sbin/poweroff
+copy_exec_if /sbin/reboot
+
+# Python standard library and cryptography extension (needed to unwrap boot.pem).
+pyver=$(/usr/bin/python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true)
+if [ -n "$pyver" ] && [ -d "/usr/lib/python$pyver" ]; then
+  mkdir -p "$DESTDIR/usr/lib/python$pyver"
+  cp -a "/usr/lib/python$pyver/." "$DESTDIR/usr/lib/python$pyver/" 2>/dev/null || true
+  if [ -d "/usr/lib/python$pyver/lib-dynload" ]; then
+    find "/usr/lib/python$pyver/lib-dynload" -name '*.so' -type f | while IFS= read -r lib; do
+      copy_exec "$lib" 2>/dev/null || true
+    done
+  fi
+fi
+# dist-packages / site-packages: cryptography, cffi, etc.
+for d in /usr/lib/python3/dist-packages /usr/lib/python3/site-packages; do
+  if [ -d "$d" ]; then
+    mkdir -p "$DESTDIR$d"
+    for pkg in cryptography cffi _cffi_backend.py bcrypt; do
+      if [ -e "$d/$pkg" ]; then
+        cp -a "$d/$pkg" "$DESTDIR$d/"
+      fi
+    done
+    find "$d" -maxdepth 1 -name '_cffi_backend*.so' -o -name 'cryptography*' | while IFS= read -r p; do
+      [ -e "$p" ] || continue
+      cp -a "$p" "$DESTDIR$d/" 2>/dev/null || true
+    done
+    find "$DESTDIR$d" -name '*.so' -type f | while IFS= read -r lib; do
+      # ensure dynamic loader deps get pulled (best-effort)
+      true
+    done
+  fi
+done
+
+mkdir -p "$DESTDIR/usr/lib/ker"
+if [ -d /usr/lib/ker/ker ]; then
+  cp -a /usr/lib/ker/ker "$DESTDIR/usr/lib/ker/"
+  find "$DESTDIR/usr/lib/ker" -depth -type d -name '__pycache__' -exec rm -rf {} +
+fi
+if [ -x /usr/lib/ker/ker-boot-check ]; then
+  install -m 755 /usr/lib/ker/ker-boot-check "$DESTDIR/usr/lib/ker/ker-boot-check"
+fi
+
+# Trust anchors and state, so early boot can verify boot.pem.
+if [ -d /etc/ker ]; then
+  mkdir -p "$DESTDIR/etc/ker"
+  if [ -f /etc/ker/state.json ]; then
+    cp -a /etc/ker/state.json "$DESTDIR/etc/ker/state.json"
+  fi
+  if [ -f /etc/ker/config.json ]; then
+    cp -a /etc/ker/config.json "$DESTDIR/etc/ker/config.json"
+  fi
+  if [ -d /etc/ker/trust ]; then
+    mkdir -p "$DESTDIR/etc/ker/trust"
+    cp -a /etc/ker/trust/. "$DESTDIR/etc/ker/trust/" 2>/dev/null || true
+  fi
+fi
+
+# Record whether a boot permission key is required (fail closed).
+if [ -f /etc/ker/state.json ]; then
+  /usr/bin/python3 -c 'import json,sys; st=json.load(open("/etc/ker/state.json")); sys.exit(0 if "boot" in (st.get("permissions") or []) else 1)' \
+    && printf 'required\n' > "$DESTDIR/etc/ker/boot-required" \
+    || printf 'optional\n' > "$DESTDIR/etc/ker/boot-required"
+fi
+
+manual_add_modules ext4 2>/dev/null || true
+manual_add_modules vfat 2>/dev/null || true
+manual_add_modules nls_cp437 2>/dev/null || true
+manual_add_modules nls_iso8859-1 2>/dev/null || true
+manual_add_modules usb_storage 2>/dev/null || true
+manual_add_modules uas 2>/dev/null || true
+manual_add_modules virtio_blk 2>/dev/null || true
+manual_add_modules virtio_pci 2>/dev/null || true
+manual_add_modules isofs 2>/dev/null || true
+exit 0

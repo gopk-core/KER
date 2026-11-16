@@ -1,0 +1,19 @@
+[Unit]
+Description=KER media watcher for kernel enforcement
+After=local-fs.target systemd-udevd.service
+ConditionPathExists=/etc/ker/state.json
+# Never enabled just because the package is installed.
+# `ker enforce --set enforce` and an upgrade of an already-enforcing install enable it
+# so a reboot restores/attaches BPF when kernel_enforcement is already on.
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/ker enforce --watch
+Restart=always
+RestartSec=2
+StartLimitIntervalSec=30
+StartLimitBurst=15
+# comm is "ker", which is on the LSM allowlist so the watcher can run while media_ok=0.
+
+[Install]
+WantedBy=multi-user.target

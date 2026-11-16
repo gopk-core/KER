@@ -1,0 +1,10 @@
+Build Alpine apk packages with:
+
+    bash packaging/build-all.sh
+    bash packaging/build-apk.sh amd64   # or arm64, armhf, i386, riscv64
+
+The payload matches the Debian package plus boot/SSH hooks. Architectures
+use Alpine names (x86_64, aarch64, armv7, x86, riscv64). Packages are
+unsigned; install with `apk add --allow-untrusted` or
+`ker upgrade --trust-package`. Do not install on the production host
+that already runs ker-guard.

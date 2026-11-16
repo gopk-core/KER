@@ -1,0 +1,16 @@
+Package: ker
+Version: 0.1
+Section: admin
+Priority: optional
+Architecture: amd64
+Depends: python3, python3-cryptography, gnupg, gpgv, openssl, dosfstools, e2fsprogs, xorriso, util-linux, keyutils, bpftool
+Replaces: ker
+Provides: ker-authorization
+Maintainer: KER
+Description: Linux media-backed kernel authorization system
+ KER verifies signed removable media and optionally enforces
+ kernel-level authorization. First run is terminal-only.
+ This package does not auto-update. A newer package takes over
+ existing keys, state, and policy and runs any needed migrations.
+ Packages are architecture-specific because they ship a BPF object
+ and ker-probe built for that architecture.

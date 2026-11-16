@@ -1,0 +1,42 @@
+__pycache__/
+*.py[cod]
+*.o
+*.img
+*.iso
+*.tar
+*.qcow2
+*.pem
+*.key
+private/
+results/
+/data/
+dist/
+.venv/
+*.egg-info/
+
+# Local-only legacy ker-guard / production-host material. These paths may
+# exist on a development machine and must not be published.
+/lib/ker-guard/
+/bin/kerctl
+/initramfs/
+/systemd/ker-guard.service
+/systemd/ker-kernel-audit.service
+/systemd/service-guard.conf
+/src/bpf/guard.bpf.c
+/src/c/loader.c
+/src/c/kernel-verify.c
+/src/media/
+/boot-trust/
+/tests/selftest.py
+/tests/media-e2e.py
+/tests/permanent-validity.py
+
+/udev/99-ker-media.rules
+
+# Local-only lab / test keys. Do not publish.
+/lab/
+/scripts/lab-web.sh
+/scripts/lab-prepare-image.sh
+/tests/test_lab.py
+/docs/media-public.asc
+/Makefile.lab

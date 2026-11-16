@@ -1,0 +1,4 @@
+# Notify KER as soon as a block device appears or vanishes.
+# Do not RUN a verifier here: udev must not mount or block. SYSTEMD_WANTS
+# starts a oneshot presence check that fail-closes immediately on unplug.
+SUBSYSTEM=="block", ACTION=="add|remove|change", TAG+="systemd", ENV{SYSTEMD_WANTS}+="ker-enforcer-poke.service"

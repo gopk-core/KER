@@ -1,0 +1,5 @@
+/usr/bin/python3
+/usr/bin/gpgv
+/usr/bin/openssl
+/usr/lib/ker/ker-boot-check
+/usr/share/mkinitfs/hooks/ker-boot

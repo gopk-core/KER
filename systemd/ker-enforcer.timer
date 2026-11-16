@@ -1,0 +1,12 @@
+[Unit]
+Description=Backup KER media presence check (the watcher is the primary path)
+ConditionPathExists=/etc/ker/state.json
+
+[Timer]
+OnBootSec=15s
+OnUnitActiveSec=30s
+AccuracySec=1s
+Unit=ker-enforcer-poke.service
+
+[Install]
+WantedBy=timers.target

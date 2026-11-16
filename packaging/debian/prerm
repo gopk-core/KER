@@ -1,0 +1,5 @@
+#!/bin/sh
+set -e
+# upgrade and remove both leave /etc/ker and /var/lib/ker alone so a
+# newer package, or a later reinstall, can take over cleanly.
+exit 0

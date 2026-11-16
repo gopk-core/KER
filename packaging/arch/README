@@ -1,0 +1,9 @@
+Build Arch pkg.tar.zst packages with:
+
+    bash packaging/build-all.sh
+    bash packaging/build-archpkg.sh amd64   # or arm64, armhf, i386, riscv64
+
+The payload matches the Debian package plus boot/SSH hooks. Architectures
+use Arch names (x86_64, aarch64, armv7h, i686, riscv64). Packages are
+unsigned; `ker upgrade --trust-package` (or `pacman -U`) is required.
+Do not install on the production host that already runs ker-guard.

@@ -1,0 +1,38 @@
+#!/bin/bash
+# /usr/lib/initcpio/install/ker-boot
+build() {
+  add_binary python3
+  add_binary gpgv
+  add_binary openssl
+  add_binary mount
+  add_binary umount
+  add_binary poweroff || true
+  add_binary /usr/lib/ker/ker-boot-check
+  [[ -d /usr/lib/ker/ker ]] && add_full_dir /usr/lib/ker/ker
+  pyver=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true)
+  [[ -n "$pyver" && -d /usr/lib/python$pyver ]] && add_full_dir /usr/lib/python$pyver
+  for d in /usr/lib/python3/dist-packages /usr/lib/python3.13/site-packages /usr/lib/python3/site-packages; do
+    [[ -d "$d/cryptography" ]] && add_full_dir "$d/cryptography"
+    [[ -d "$d/cffi" ]] && add_full_dir "$d/cffi"
+  done
+  [[ -f /etc/ker/state.json ]] && add_file /etc/ker/state.json
+  [[ -f /etc/ker/config.json ]] && add_file /etc/ker/config.json
+  [[ -d /etc/ker/trust ]] && add_full_dir /etc/ker/trust
+  if [[ -f /etc/ker/state.json ]] && python3 -c 'import json,sys; st=json.load(open("/etc/ker/state.json")); sys.exit(0 if "boot" in (st.get("permissions") or []) else 1)'; then
+    echo required > "${BUILDROOT}/etc/ker/boot-required"
+  else
+    mkdir -p "${BUILDROOT}/etc/ker"
+    echo optional > "${BUILDROOT}/etc/ker/boot-required"
+  fi
+  add_module ext4
+  add_module vfat
+  add_module nls_cp437
+  add_module virtio_blk || true
+  add_runscript
+}
+help() {
+  cat <<HELPEOF
+KER early-boot authorization: require a valid boot.pem medium before the real
+root is mounted, fail closed in enforcement mode.
+HELPEOF
+}

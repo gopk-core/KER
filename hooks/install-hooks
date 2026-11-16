@@ -1,0 +1,60 @@
+#!/bin/sh
+# Enable KER boot and SSH hooks on a target system. Never run this against the
+# production host's live ker-guard stack. Safe to call repeatedly.
+set -eu
+
+legacy_guard() {
+  # Only trust systemctl in a namespace that actually has systemd. A chroot
+  # or initramfs must not observe the build host's ker-guard unit.
+  [ -d /run/systemd/system ] || return 1
+  command -v systemctl >/dev/null 2>&1 || return 1
+  systemctl is-active --quiet ker-guard.service 2>/dev/null
+}
+
+if legacy_guard && [ "${KER_ALLOW_HOST_HOOKS:-}" != "1" ]; then
+  echo "ker install-hooks: refusing to modify this host because ker-guard.service is active" >&2
+  exit 0
+fi
+
+install_sshd() {
+  if [ ! -d /etc/ssh/sshd_config.d ] && [ ! -f /etc/ssh/sshd_config ]; then
+    return 0
+  fi
+  if [ -d /etc/ssh/sshd_config.d ] && [ -f /usr/lib/ker/hooks/sshd/99-ker.conf ]; then
+    install -d -m 755 /etc/ssh/sshd_config.d
+    install -m 644 /usr/lib/ker/hooks/sshd/99-ker.conf /etc/ssh/sshd_config.d/99-ker.conf
+    return 0
+  fi
+  if [ -f /etc/ssh/sshd_config ] && ! grep -q 'AuthorizedKeysCommand /usr/lib/ker/ker-ssh-keys' /etc/ssh/sshd_config; then
+    printf '\n# KER SSH hook\nAuthorizedKeysCommand /usr/lib/ker/ker-ssh-keys\nAuthorizedKeysCommandUser root\n' >> /etc/ssh/sshd_config
+  fi
+}
+
+install_pam() {
+  target=""
+  for f in /etc/pam.d/sshd /etc/pam.d/ssh; do
+    if [ -f "$f" ]; then
+      target=$f
+      break
+    fi
+  done
+  [ -n "$target" ] || return 0
+  if grep -q 'KER-SSH-HOOK-BEGIN' "$target"; then
+    return 0
+  fi
+  if [ -f /usr/lib/ker/hooks/pam/ker-sshd ]; then
+    cat /usr/lib/ker/hooks/pam/ker-sshd >> "$target"
+  fi
+}
+
+install_sshd
+install_pam
+
+# Initramfs hook files are shipped under /usr/share and /usr/lib; include them
+# in a newly built image only when allowed (VM or KER_ALLOW_HOST_INITRAMFS=1).
+if [ "${KER_ALLOW_HOST_INITRAMFS:-}" = "1" ] || [ "${KER_IN_VM:-}" = "1" ]; then
+  if command -v python3 >/dev/null 2>&1 && [ -x /usr/sbin/ker ]; then
+    PYTHONPATH="/usr/lib/ker${PYTHONPATH:+:$PYTHONPATH}" python3 -c 'from ker.hooks import refresh_boot_initramfs; print(refresh_boot_initramfs())' || true
+  fi
+fi
+exit 0
