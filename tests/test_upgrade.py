@@ -111,7 +111,7 @@ class UpgradeTests(unittest.TestCase):
         from ker.compat import takeover_errors
         st = {
             'initialized': True,
-            'package_version': '0.2.0',
+            'package_version': '1.0.0',
             'state_schema': 1,
             'media_schema': 2,
             'crypto_epoch': 1,
@@ -126,6 +126,25 @@ class UpgradeTests(unittest.TestCase):
         }
         errs = takeover_errors(st, target)
         self.assertTrue(any('downgrade' in e for e in errs))
+
+    def test_first_public_release_takes_over_unreleased(self):
+        from ker.compat import takeover_errors
+        st = {
+            'initialized': True,
+            'package_version': '0.4.2',
+            'state_schema': 1,
+            'media_schema': 2,
+            'crypto_epoch': 1,
+        }
+        target = {
+            'package_version': '0.1',
+            'state_schema': 1,
+            'min_state_schema': 0,
+            'min_upgrade_from_package': '0.1.0',
+            'supported_media_schemas': [2],
+            'supported_crypto_epochs': [1],
+        }
+        self.assertEqual(takeover_errors(st, target), [])
 
     def test_snapshot_and_rollback(self):
         self._legacy_state()

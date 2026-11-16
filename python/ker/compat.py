@@ -19,6 +19,17 @@ CRYPTO_EPOCH = 1
 MIN_UPGRADE_FROM_PACKAGE = '0.1.0'
 MIN_STATE_SCHEMA = 0
 
+# Unreleased development versions superseded by the first public release (0.1).
+# 0.1 may take these over; they are not treated as a downgrade. Do not reuse
+# these numbers for a later public release.
+UNRELEASED_PREDECESSORS = {
+    (0, 2, 0),
+    (0, 3, 0),
+    (0, 4, 0),
+    (0, 4, 1),
+    (0, 4, 2),
+}
+
 # Formats this code can still read. Never drop a value still in the field.
 SUPPORTED_MEDIA_SCHEMAS = (2,)
 SUPPORTED_CRYPTO_EPOCHS = (1,)
@@ -110,13 +121,17 @@ def takeover_errors(st: dict | None, target: dict | None = None) -> list[str]:
     if epoch is not None and epoch not in set(target['supported_crypto_epochs']):
         errors.append(f'unsupported crypto_epoch {epoch}')
     pv = info['package_version'] or '0.0.0'
-    if ver_cmp(pv, target['min_upgrade_from_package']) < 0:
+    if ver_cmp(pv, target['min_upgrade_from_package']) < 0 and ver_tuple(pv) not in UNRELEASED_PREDECESSORS:
         errors.append(
             f"package {pv} is older than min_upgrade_from_package "
             f"{target['min_upgrade_from_package']}"
         )
+    superseded = (
+        ver_tuple(pv) in UNRELEASED_PREDECESSORS
+        and ver_tuple(target['package_version']) == (0, 1, 0)
+    )
     if ver_cmp(pv, target['package_version']) > 0 and schema > int(target['state_schema']):
         errors.append(f"installed package {pv} is newer than {target['package_version']}")
-    elif ver_cmp(pv, target['package_version']) > 0:
+    elif ver_cmp(pv, target['package_version']) > 0 and not superseded:
         errors.append(f'downgrade from {pv} to {target["package_version"]} is refused')
     return errors

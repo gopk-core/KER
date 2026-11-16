@@ -13,7 +13,7 @@ ARCHES = ['amd64', 'arm64', 'armhf', 'i386', 'riscv64']
 
 
 class PackagingTests(unittest.TestCase):
-    def test_version_is_0_4_2(self):
+    def test_version_is_0_1(self):
         import ker
         self.assertEqual(ker.__version__, '0.1')
 
