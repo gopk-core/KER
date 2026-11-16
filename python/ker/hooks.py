@@ -296,22 +296,123 @@ def authorize(permission: str, st: dict | None = None, devices: list[str] | None
     return base
 
 
-def verified_custom_keys(st: dict | None = None) -> set[str]:
-    """Keys on media that are present and verified. Any verify failure grants none."""
-    from ker.enforce import presence_sets
-    from ker.testmode import verify_each
-    st = st or load_state()
-    present, missing = presence_sets(st)
+# In-process copy of the last presence-bound result. The file under RUN_DIR
+# is what the next PAM process reads. Neither survives a presence change,
+# a generation change, or an explicit invalidation.
+_CUSTOM_KEY_MEM: dict = {'token': None, 'keys': None}
+
+
+def _custom_cache_paths() -> tuple[Path, Path]:
+    from ker.paths import RUN_DIR
+    return RUN_DIR / 'custom-keys.json', RUN_DIR / 'custom-keys.epoch'
+
+
+def _read_custom_key_epoch() -> int:
+    _cache, epoch = _custom_cache_paths()
+    try:
+        return int(epoch.read_text(encoding='utf-8').strip() or '0')
+    except (OSError, ValueError):
+        return 0
+
+
+def invalidate_verified_custom_keys() -> None:
+    """Forget the verified-key result immediately.
+
+    Used when a medium is removed, a verify fails, or a presence update
+    says the previous result is no longer safe. There is no TTL: the next
+    hook call must not keep the old set.
+    """
+    _CUSTOM_KEY_MEM['token'] = None
+    _CUSTOM_KEY_MEM['keys'] = None
+    cache, epoch = _custom_cache_paths()
+    try:
+        cache.unlink()
+    except OSError:
+        pass
+    try:
+        epoch.parent.mkdir(parents=True, exist_ok=True)
+        current = 0
+        try:
+            current = int(epoch.read_text(encoding='utf-8').strip() or '0')
+        except (OSError, ValueError):
+            current = 0
+        tmp = epoch.with_suffix('.epoch.tmp')
+        tmp.write_text(str(current + 1), encoding='utf-8')
+        os.replace(tmp, epoch)
+    except OSError:
+        pass
+
+
+def _medium_cache_row(medium) -> tuple:
+    if not isinstance(medium, dict):
+        return (str(medium),)
+    keys = tuple(sorted(str(k) for k in (medium.get('keys') or [])))
+    return (
+        str(medium.get('media_id') or ''),
+        str(medium.get('path') or ''),
+        str(medium.get('role') or ''),
+        keys,
+    )
+
+
+def _custom_key_token(st: dict, present: list, missing: list) -> str:
+    import hashlib
+    payload = {
+        'epoch': _read_custom_key_epoch(),
+        'generation': int(st.get('key_generation') or 0),
+        'fingerprint': str(st.get('gpg_fingerprint') or ''),
+        'cert': str(st.get('kernel_cert_sha256') or ''),
+        'present': sorted(_medium_cache_row(m) for m in present),
+        'missing': sorted(_medium_cache_row(m) for m in missing),
+    }
+    raw = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _inactive_medium_keys(missing: list) -> set[str]:
     inactive: set[str] = set()
     for medium in missing:
         if isinstance(medium, dict):
             inactive.update(medium.get('keys') or [])
-    if not present:
-        return set()
+    return inactive
+
+
+def _load_custom_key_cache(token: str) -> set[str] | None:
+    if _CUSTOM_KEY_MEM.get('token') == token and _CUSTOM_KEY_MEM.get('keys') is not None:
+        return set(_CUSTOM_KEY_MEM['keys'])
+    cache, _epoch = _custom_cache_paths()
     try:
-        report = verify_each(st, devices=present)
-    except Exception:
-        return set()
+        data = json.loads(cache.read_text(encoding='utf-8'))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict) or data.get('token') != token:
+        return None
+    keys = data.get('keys')
+    if not isinstance(keys, list):
+        return None
+    found = {str(k) for k in keys}
+    _CUSTOM_KEY_MEM['token'] = token
+    _CUSTOM_KEY_MEM['keys'] = set(found)
+    return found
+
+
+def _store_custom_key_cache(token: str, keys: set[str]) -> None:
+    _CUSTOM_KEY_MEM['token'] = token
+    _CUSTOM_KEY_MEM['keys'] = set(keys)
+    cache, _epoch = _custom_cache_paths()
+    try:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache.with_suffix('.json.tmp')
+        tmp.write_text(
+            json.dumps({'token': token, 'keys': sorted(keys)}, sort_keys=True),
+            encoding='utf-8',
+        )
+        os.replace(tmp, cache)
+    except OSError:
+        pass
+
+
+def _active_keys_from_report(present: list, report: dict) -> set[str]:
     failed_paths = set()
     for medium in list(report.get('failed') or []) + list(report.get('missing') or []):
         if isinstance(medium, dict) and medium.get('path'):
@@ -328,7 +429,44 @@ def verified_custom_keys(st: dict | None = None) -> set[str]:
             if not passed:
                 continue
         active.update(medium.get('keys') or [])
-    return active - inactive
+    return active
+
+
+def verified_custom_keys(st: dict | None = None) -> set[str]:
+    """Keys on media that are present and verified.
+
+    A full verify_each is not run on every call. The result is reused only
+    while the presence token is unchanged (same media, generation, trust
+    anchors, and invalidation epoch). Removing a medium, failing one, or a
+    presence update changes that token or clears the cache, so the old
+    verified set is not kept. There is no TTL.
+    """
+    from ker.enforce import presence_sets
+    st = st or load_state()
+    present, missing = presence_sets(st)
+    inactive = _inactive_medium_keys(missing)
+    token = _custom_key_token(st, present, missing)
+    cached = _load_custom_key_cache(token)
+    if cached is not None:
+        return set(cached) - inactive
+    if not present:
+        _store_custom_key_cache(token, set())
+        return set()
+    from ker.testmode import verify_each
+    try:
+        report = verify_each(st, devices=present)
+    except Exception:
+        # Uncertain. Do not cache a success, and do not grant.
+        return set()
+    present_now, missing_now = presence_sets(st)
+    inactive_now = _inactive_medium_keys(missing_now)
+    token_now = _custom_key_token(st, present_now, missing_now)
+    active = _active_keys_from_report(present_now, report) - inactive_now
+    # An unplug during the verify changed the token. Do not store the
+    # pre-unplug result under the old token.
+    if token_now == token:
+        _store_custom_key_cache(token, active)
+    return active
 
 
 def merge_login_constraint(decision: dict, user: str, st: dict | None = None,

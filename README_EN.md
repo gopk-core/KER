@@ -84,7 +84,7 @@ The full contract is in [docs/upgrade.md](docs/upgrade.md).
 
 `boot.pem` is enforced by early-boot hooks for initramfs-tools, dracut, mkinitcpio, and mkinitfs. In enforcement mode, missing media or a failed verify refuses to continue to the real root filesystem and reports the reason on the console. In test mode the same condition is logged and boot is allowed to proceed.
 
-SSH hooks (a PAM account module and `AuthorizedKeysCommand`) follow the same rule: in enforcement mode, a missing `ssh.pem` rejects both password and public-key logins; test mode only logs. Details are in [docs/hooks.md](docs/hooks.md).
+SSH hooks (a PAM account module and `AuthorizedKeysCommand`) follow the same rule: in enforcement mode, a missing `ssh.pem` rejects both password and public-key logins; test mode only logs. The PAM helper does not mount and verify every medium on every login. It reuses a result bound to the current presence. Removing a medium, a failed verify, or a state-generation change drops that result immediately. It does not keep an old verified set for a waiting period. Details are in [docs/hooks.md](docs/hooks.md).
 
 ## Runtime enforcement and live media presence
 
@@ -95,7 +95,8 @@ Once enforcement is on:
 - `ker enforce --watch` runs as a persistent systemd service and is enabled so that BPF maps are restored at boot;
 - udev triggers an immediate presence check when block devices appear or disappear, with a timer as a backup;
 - **One medium, one set of bits**: removing or failing to verify the medium that holds `ssh.pem` denies SSH only. Read, write, execute, network, and root login follow their own key media. A missing `root.pem` medium denies every selected runtime permission, because no permission can be established without it. `boot.pem` is enforced by the early-boot hook, and `admin.pem` is enforced by `ker console`.
-- **Custom rules stay scoped.** A rule that names paths, users, ports, or units authorizes only those subjects. If a constraint cannot be checked exactly, that rule authorizes nothing and is not widened into a machine-wide execute, read, write, or network bit.
+- **Custom rules stay scoped.** A rule that names paths, users, ports, or units authorizes only those subjects. If a constraint cannot be checked exactly, that rule authorizes nothing and is not widened into a machine-wide execute, read, write, or network bit. A network rule that names only ports allows those destination ports to any address, because that is what it said. A rule that also names addresses must match the address and the port together. An address-only, interface-only, or direction-only rule authorizes nothing, as does a port rule that also names an address form, interface, or inbound direction the connect hook cannot check exactly. It is not widened to "any address on this port". A login rule applies to login, setuid-to-root, and the SSH PAM helper. It does not clear the root-login bit on a non-root uid's ordinary exec.
+- **`media_ok` set to 1 does not open every class.** It means the deny mask is not being applied for a missing or unverified medium. An active replace rule's `narrow_mask` is policy, not a presence flag, and it still narrows that class while every medium is present and verified.
 - **Deny first, then verify**: removing a runtime-required medium clears the bits that medium authorizes immediately, without waiting for a mount or a signature check. Reinserting it and a successful verify restores those bits.
 - Enforcement is never enabled by a package install or upgrade. Turn it off with `ker enforce --set test`.
 

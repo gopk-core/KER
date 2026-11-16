@@ -219,3 +219,101 @@ class HookPackagingContractTests(unittest.TestCase):
         refuse = init.split('refuse_boot()', 1)[1].split('}', 1)[0]
         self.assertNotIn('switch_root', refuse)
 
+
+class VerifiedKeyCacheTests(unittest.TestCase):
+    def test_second_hook_skips_verify_and_unplug_drops_the_key(self):
+        from unittest.mock import patch
+        from ker.hooks import invalidate_verified_custom_keys, merge_login_constraint, verified_custom_keys
+        alice = {'path': '/dev/ker-alice', 'media_id': 'a', 'role': 'keys', 'keys': ['alice.pem']}
+        bob = {'path': '/dev/ker-bob', 'media_id': 'b', 'role': 'keys', 'keys': ['bob.pem']}
+        st = {
+            'initialized': True, 'key_generation': 3,
+            'gpg_fingerprint': 'A' * 40, 'kernel_cert_sha256': 'b' * 64,
+            'kernel_enforcement': True, 'mode': 'enforce',
+            'custom': [{
+                'name': 'alice', 'type': 'login', 'mode': 'lock', 'key': 'alice.pem',
+                'constraints': {'users': ['alice']},
+            }],
+            'media': [alice, bob],
+        }
+        box = {'present': [alice, bob], 'missing': []}
+        calls = {'n': 0}
+
+        def presence(_st=None):
+            return list(box['present']), list(box['missing'])
+
+        def verify(_st, devices=None, **kwargs):
+            calls['n'] += 1
+            return {
+                'ok': True, 'missing': [], 'failed': [],
+                'results': [{'ok': True, 'path': m.get('path')} for m in (devices or [])],
+            }
+
+        with tempfile.TemporaryDirectory(prefix='ker-keycache-') as tmp, \
+             patch('ker.paths.RUN_DIR', Path(tmp)), \
+             patch('ker.enforce.presence_sets', side_effect=presence), \
+             patch('ker.testmode.verify_each', side_effect=verify):
+            invalidate_verified_custom_keys()
+            first = verified_custom_keys(st)
+            second = verified_custom_keys(st)
+            self.assertEqual(first, {'alice.pem', 'bob.pem'})
+            self.assertEqual(second, first)
+            self.assertEqual(calls['n'], 1)
+            base = {'allow': True, 'block': False, 'mode': 'enforce'}
+            pam = merge_login_constraint(base, 'alice', st)
+            self.assertFalse(pam['block'])
+            self.assertEqual(calls['n'], 1)
+
+            box['present'] = [alice]
+            box['missing'] = [bob]
+            dropped = verified_custom_keys(st)
+            self.assertIn('alice.pem', dropped)
+            self.assertNotIn('bob.pem', dropped)
+            # The removed key is gone without a TTL. A fresh verify of what
+            # remains is fine; the old verified set is not reused.
+            self.assertGreaterEqual(calls['n'], 2)
+
+            box['present'] = [alice, bob]
+            box['missing'] = []
+            invalidate_verified_custom_keys()
+
+            def fail_bob(_st, devices=None, **kwargs):
+                calls['n'] += 1
+                return {
+                    'ok': False, 'missing': [], 'failed': [bob],
+                    'results': [
+                        {'ok': True, 'path': alice['path']},
+                        {'ok': False, 'path': bob['path']},
+                    ],
+                }
+
+            with patch('ker.testmode.verify_each', side_effect=fail_bob):
+                failed = verified_custom_keys(st)
+                mark = calls['n']
+                again = verified_custom_keys(st)
+            self.assertIn('alice.pem', failed)
+            self.assertNotIn('bob.pem', failed)
+            self.assertEqual(again, failed)
+            self.assertEqual(calls['n'], mark)
+
+            # A generation change must not keep the previous verified set.
+            st['key_generation'] = 4
+            with patch('ker.testmode.verify_each', side_effect=verify):
+                before = calls['n']
+                regenerated = verified_custom_keys(st)
+                self.assertEqual(calls['n'], before + 1)
+            self.assertEqual(regenerated, {'alice.pem', 'bob.pem'})
+
+
+class VmScriptGuardTests(unittest.TestCase):
+    def test_guest_scripts_do_not_touch_the_host(self):
+        vm = (ROOT / 'scripts' / 'vm-test.sh').read_text()
+        guest = (ROOT / 'scripts' / 'vm-selftest.sh').read_text()
+        self.assertIn('chroot "$ROOTFS" dpkg -i', vm)
+        self.assertIn('Never dpkg -i on the host', vm)
+        self.assertIn('env -u KER_ALLOW_HOST_BPF', vm)
+        self.assertNotIn('bpftool', vm)
+        self.assertIn('[ "$$" -ne 1 ]', guest)
+        self.assertIn('init=/usr/lib/ker/vm-selftest.sh', guest)
+        self.assertIn('ker.selftest=phase2', guest)
+

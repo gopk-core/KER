@@ -16,7 +16,8 @@ TRUST_DIR = ETC / 'trust'
 VAR = _p('var', 'lib', 'ker')
 PRIVATE_DIR = VAR / 'private'
 LOG_DIR = _p('var', 'log', 'ker')
-MOUNT_ROOT = _p('run', 'ker', 'media')
+RUN_DIR = _p('run', 'ker')
+MOUNT_ROOT = RUN_DIR / 'media'
 
 UPGRADE_DIR = VAR / 'upgrade'
 SNAPSHOT_DIR = UPGRADE_DIR / 'snapshots'

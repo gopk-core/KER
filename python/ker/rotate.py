@@ -167,13 +167,20 @@ def rotate(*, assume_replug: bool = False, lang: str = 'zh-CN',
 
     _req_present, _req_missing, present, missing = runtime_presence(st)
     if missing and not allow_missing:
-        try:
-            report = verify_all(st)
-        except Exception as e:
-            raise RotateError(f'media must all verify before rotation: {e}') from e
-        if not report.get('ok'):
-            raise RotateError('media must all verify before rotation')
-        raise RotateError('media must all verify before rotation')
+        # The disk is already gone and this call did not allow dropping or
+        # replacing it. Verifying the rest would not make the missing medium
+        # acceptable, so refuse before any verify.
+        labels = []
+        for medium in missing:
+            if isinstance(medium, dict):
+                labels.append(str(medium.get('path') or medium.get('media_id') or '(unknown)'))
+            else:
+                labels.append(str(medium))
+        listed = ', '.join(labels) or '(unknown)'
+        raise RotateError(
+            'lost medium %s: refusing to rotate while media are missing '
+            'and dropping or replacing them was not allowed' % listed
+        )
     if not missing:
         try:
             report = verify_all(st)

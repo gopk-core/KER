@@ -129,10 +129,14 @@ class RotatePolicyTests(unittest.TestCase):
             calls.append((bool(enabled), bool(verified)))
 
         with patch('ker.rotate.runtime_presence', return_value=([root], [ssh], [root], [ssh])), \
-             patch('ker.rotate.verify_all', side_effect=RuntimeError('gone')):
+             patch('ker.rotate.verify_all') as verify_all:
             with self.assertRaises(RotateError) as caught:
                 rotate(assume_replug=True)
-        self.assertIn('verify', str(caught.exception).lower())
+        verify_all.assert_not_called()
+        text = str(caught.exception).lower()
+        self.assertIn('missing', text)
+        self.assertIn('refusing', text)
+        self.assertIn('/dev/ssh', text)
         self.assertEqual(calls, [])
 
         def _fake_keys(**kwargs):
@@ -321,6 +325,69 @@ class RotatePolicyTests(unittest.TestCase):
         admin.assert_not_called()
         self.assertEqual(rc, 0)
         self.assertEqual(rot.call_args.kwargs['replacements']['s']['path'], '/dev/new')
+
+    def test_missing_disk_without_allow_drop_or_replace_is_refused(self):
+        """A missing disk is refused before verify_all when drop/replace was not allowed.
+
+        The old branch called verify_all and then raised unconditionally, so
+        the verify was dead. This path must still refuse, and it must not
+        look like a fall-through.
+        """
+        tmp = tempfile.TemporaryDirectory(prefix='ker-rot-missing-')
+        self.addCleanup(tmp.cleanup)
+        os.environ['KER_PREFIX'] = tmp.name
+        os.environ['KER_SKIP_SYSTEMD'] = '1'
+        from importlib import reload
+        import ker.paths as paths
+        import ker.state as state_mod
+        reload(paths)
+        reload(state_mod)
+        import ker.rotate as rotate_mod
+        reload(rotate_mod)
+
+        def _restore_modules():
+            os.environ.pop('KER_PREFIX', None)
+            os.environ.pop('KER_SKIP_SYSTEMD', None)
+            reload(paths)
+            reload(state_mod)
+            reload(rotate_mod)
+        self.addCleanup(_restore_modules)
+        from ker.rotate import RotateError, rotate
+        from ker.state import save_state
+        root = {
+            'path': '/dev/root', 'media_id': 'r', 'kind': 'disk', 'role': 'root',
+            'keys': ['root.pem', 'write.pem'],
+        }
+        ssh = {
+            'path': '/dev/ssh', 'media_id': 's', 'kind': 'disk', 'role': 'keys',
+            'keys': ['ssh.pem'],
+        }
+        save_state({
+            'initialized': True, 'role': 'master', 'cluster_id': 'c',
+            'permissions': ['write', 'ssh'], 'custom': [],
+            'media': [root, ssh], 'root_media_id': 'r',
+            'mode': 'test', 'kernel_enforcement': False,
+            'children': [], 'key_generation': 1,
+            'gpg_fingerprint': 'A' * 40, 'kernel_cert_sha256': 'b' * 64,
+        })
+        with patch('ker.rotate.runtime_presence', return_value=([root], [ssh], [root], [ssh])), \
+             patch('ker.rotate.verify_all') as verify_all, \
+             patch('ker.rotate.verify_each') as verify_each, \
+             patch('ker.rotate._apply_kernel_mode') as apply_mode:
+            with self.assertRaises(RotateError) as caught:
+                rotate(assume_replug=True)
+            with self.assertRaises(RotateError):
+                rotate(assume_replug=True, drop_missing=True)
+            with self.assertRaises(RotateError):
+                rotate(assume_replug=True, replacements={'s': {'path': '/dev/new'}})
+        verify_all.assert_not_called()
+        verify_each.assert_not_called()
+        apply_mode.assert_not_called()
+        self.assertIn('refusing', str(caught.exception).lower())
+        src = (Path(__file__).resolve().parents[1] / 'python' / 'ker' / 'rotate.py').read_text()
+        branch = src.split('if missing and not allow_missing:', 1)[1].split('if not missing:', 1)[0]
+        self.assertNotIn('verify_all', branch)
+        self.assertEqual(branch.count('raise RotateError'), 1)
 
 
 class PackageSignatureTests(unittest.TestCase):

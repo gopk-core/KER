@@ -104,11 +104,99 @@ def ports_of(constraints: dict | None) -> list[int] | None:
     return out
 
 
+# connect() is outbound. These names are the only direction values that
+# the hook can check exactly. Inbound needs a listen/accept hook, which is not
+# installed, so it is not expressible.
+_OUTBOUND = frozenset({'out', 'outbound', 'egress', 'connect'})
+_INBOUND = frozenset({'in', 'inbound', 'ingress', 'listen', 'accept'})
+
+
+def parse_exact_ip(value) -> tuple[str, bytes] | None:
+    """One exact IPv4 or IPv6 address, or None.
+
+    CIDR prefixes, hostnames, wildcards, and zone indexes are not a single
+    destination the connect hook can name, so they are rejected.
+    """
+    import ipaddress
+    raw = str(value or '').strip()
+    if not raw or '/' in raw or '%' in raw or any(ch in raw for ch in '*?'):
+        return None
+    try:
+        ip = ipaddress.ip_address(raw)
+    except ValueError:
+        return None
+    if isinstance(ip, ipaddress.IPv4Address):
+        return ('4', ip.packed)
+    return ('6', ip.packed)
+
+
+def _direction_list(constraints: dict | None) -> list[str] | None:
+    """Named directions, an empty list when none are named, or None if not exact."""
+    raw = (constraints or {}).get('direction')
+    if raw is None or raw == '' or raw == []:
+        return []
+    vals = [str(v).strip().lower() for v in _as_list(raw)]
+    vals = [v for v in vals if v]
+    if not vals:
+        return []
+    if any(v not in _OUTBOUND and v not in _INBOUND for v in vals):
+        return None
+    return vals
+
+
+def _interfaces_named(constraints: dict | None) -> bool:
+    for raw in _as_list((constraints or {}).get('interfaces')):
+        if str(raw or '').strip():
+            return True
+    return False
+
+
+def network_scope(constraints: dict | None) -> dict | None:
+    """Exact socket_connect scope, or None when the rule must authorize nothing.
+
+    A ports-only rule (no addrs, interfaces, or direction) grants those
+    destination ports to any address, because that is what the rule said.
+    Addresses, when present, are an exact allow-list and are enforced
+    together with the ports. The connect hook does not see the egress
+    interface (routing is later; SO_BINDTODEVICE is a different constraint),
+    so a named interface authorizes nothing. Direction is exact only when
+    every named value is outbound. Inbound, or any address form that is
+    not a single IP, authorizes nothing — the rule is not widened to the
+    port alone or to the address alone.
+    """
+    constraints = constraints or {}
+    if not isinstance(constraints, dict):
+        return None
+    if _interfaces_named(constraints):
+        return None
+    directions = _direction_list(constraints)
+    if directions is None or any(v not in _OUTBOUND for v in directions):
+        return None
+    ports = ports_of(constraints)
+    if not ports:
+        return None
+    addrs: list[tuple[str, bytes]] = []
+    for raw in _as_list(constraints.get('addrs')):
+        parsed = parse_exact_ip(raw)
+        if parsed is None:
+            return None
+        if parsed not in addrs:
+            addrs.append(parsed)
+    return {
+        'ports': ports,
+        'addrs': addrs,
+        'any_addr': not addrs,
+        'outbound': bool(directions),
+    }
+
+
 def rule_expressible(item: dict | None) -> bool:
     """True when every constraint can be checked without widening the rule.
 
-    Network rules that name only addresses, interfaces, or a direction cannot
-    be matched as an exact port allow-list, so they are not expressible.
+    A network rule that names only addresses, only an interface, or only a
+    direction is not expressible. The same is true when it names a port and
+    also a constraint the connect hook cannot check exactly: that rule
+    authorizes nothing, rather than the port alone.
     """
     if not isinstance(item, dict):
         return False
@@ -128,8 +216,7 @@ def rule_expressible(item: dict | None) -> bool:
     if typ == 'login':
         return bool(_as_list(constraints.get('users')) or _as_list(constraints.get('uids')))
     if typ == 'network':
-        ports = ports_of(constraints)
-        return bool(ports)
+        return network_scope(constraints) is not None
     if typ == 'service':
         units = _as_list(constraints.get('units'))
         return bool(units) and all(_unit_name_ok(u) for u in units)
@@ -145,11 +232,13 @@ def _unit_name_ok(name) -> bool:
 
 def subject_matches(item: dict, *, path: str | None = None, user: str | None = None,
                     uid: int | None = None, port: int | None = None,
-                    unit: str | None = None) -> bool:
+                    unit: str | None = None, addr: str | None = None,
+                    direction: str | None = None, interface: str | None = None) -> bool:
     """True only when this subject sits inside the rule's own constraints.
 
-    A different path, user, or port never matches. An unexpressible rule
-    matches nothing.
+    A different path, user, port, or address never matches. An unexpressible
+    rule matches nothing. A network rule that names an address does not
+    match a port check that omits the address.
     """
     if not rule_expressible(item):
         return False
@@ -177,13 +266,27 @@ def subject_matches(item: dict, *, path: str | None = None, user: str | None = N
             return True
         return False
     if typ == 'network':
-        if port is None:
+        scope = network_scope(constraints)
+        if scope is None or port is None:
             return False
-        ports = ports_of(constraints) or []
         try:
-            return int(port) in ports
+            port_n = int(port)
         except (TypeError, ValueError):
             return False
+        if port_n not in scope['ports']:
+            return False
+        if scope['addrs']:
+            parsed = parse_exact_ip(addr)
+            if parsed is None or parsed not in scope['addrs']:
+                return False
+        if scope['outbound']:
+            # connect() is outbound. A caller that does not say so has not
+            # shown that this subject is the action the rule named.
+            if str(direction or '').strip().lower() not in _OUTBOUND:
+                return False
+        if interface:
+            return False
+        return True
     if typ == 'service':
         if unit is None:
             return False
@@ -212,6 +315,8 @@ def iter_custom(st: dict | None, *, kind: str | None = None) -> list[dict]:
 def custom_authorizes(st: dict | None, *, kind: str, path: str | None = None,
                       user: str | None = None, uid: int | None = None,
                       port: int | None = None, unit: str | None = None,
+                      addr: str | None = None, direction: str | None = None,
+                      interface: str | None = None,
                       active_keys: set[str] | None = None) -> bool:
     """True only when an active, expressible rule of this kind covers the subject.
 
@@ -223,17 +328,25 @@ def custom_authorizes(st: dict | None, *, kind: str, path: str | None = None,
             continue
         if item.get('mode') not in (None, 'grant', 'lock', 'replace'):
             continue
-        if subject_matches(item, path=path, user=user, uid=uid, port=port, unit=unit):
+        if subject_matches(
+            item, path=path, user=user, uid=uid, port=port, unit=unit,
+            addr=addr, direction=direction, interface=interface,
+        ):
             return True
     return False
 
 
 def governed_subject(st: dict | None, *, kind: str, path: str | None = None,
                      user: str | None = None, uid: int | None = None,
-                     port: int | None = None, unit: str | None = None) -> bool:
+                     port: int | None = None, unit: str | None = None,
+                     addr: str | None = None, direction: str | None = None,
+                     interface: str | None = None) -> bool:
     """True when any expressible rule of this kind names the subject, active or not."""
     for item in iter_custom(st, kind=kind):
-        if subject_matches(item, path=path, user=user, uid=uid, port=port, unit=unit):
+        if subject_matches(
+            item, path=path, user=user, uid=uid, port=port, unit=unit,
+            addr=addr, direction=direction, interface=interface,
+        ):
             return True
     return False
 

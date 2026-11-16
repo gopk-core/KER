@@ -6,9 +6,13 @@
 
 /* Global flag + per-category deny when enforcement is on.
  *
- * media_ok == 1 means no runtime permission bit is currently denied.
+ * media_ok == 1 means no selected runtime bit is denied because a medium
+ * is missing or unverified. It does not mean decide() allows every class.
  * deny_mask lists the bits to deny when media_ok == 0. Removing one
  * permission medium denies only the bits that medium authorizes.
+ * narrow_mask is policy from an active replace rule. It is applied even
+ * when media_ok is 1: media_ok == 1 does not open a class that narrow_mask
+ * still names. Older writers leave narrow_mask zero.
  *
  * Allowlisting is by inode+device of concrete executable paths, filled
  * from userspace (ker.enforce.ALLOWED_EXEC_PATHS) into the allow_inos
@@ -16,8 +20,10 @@
  * to systemd must not pass, and /usr/lib/ker/ as a directory is not allowed.
  *
  * Custom rules do not set a machine-wide bit. scope_inos / scope_uids /
- * scope_ports name the exact subject. narrow_mask is the class bits an
- * active replace rule has narrowed; older writers leave it zero.
+ * scope_ports / scope_net4 / scope_net6 name the exact subject. A port
+ * entry is a ports-only grant (any destination address). An address
+ * constraint is a scope_net4 or scope_net6 entry and is never widened
+ * into the port map.
  *
  * Linux MAY_* values (include/linux/fs.h):
  *   MAY_EXEC 0x1, MAY_WRITE 0x2, MAY_READ 0x4, MAY_APPEND 0x8.
@@ -94,6 +100,40 @@ struct {
     __type(value, struct scope_val);
 } scope_ports SEC(".maps");
 
+/* Address + port. Key layout is shared with ker.enforce.net4_key_bytes /
+ * net6_key_bytes: address bytes in wire order, then host-order port.
+ * A ports-only grant stays in scope_ports and is not written here.
+ */
+struct net4_key {
+    __u8 addr[4];
+    __u16 port;
+    __u16 pad;
+};
+
+struct net6_key {
+    __u8 addr[16];
+    __u16 port;
+    __u16 pad;
+};
+
+/* Userspace packs these exact widths. A trailing pad would desync the maps. */
+_Static_assert(sizeof(struct net4_key) == 8, "net4 key size");
+_Static_assert(sizeof(struct net6_key) == 20, "net6 key size");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 256);
+    __type(key, struct net4_key);
+    __type(value, struct scope_val);
+} scope_net4 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 256);
+    __type(key, struct net6_key);
+    __type(value, struct scope_val);
+} scope_net6 SEC(".maps");
+
 static __always_inline int ino_allowed(__u64 ino, __u32 dev)
 {
     struct allow_key k = {};
@@ -128,6 +168,16 @@ static __always_inline int scope_for_uid(__u32 uid, struct scope_val *out)
 static __always_inline int scope_for_port(__u32 port, struct scope_val *out)
 {
     return scope_copy(out, bpf_map_lookup_elem(&scope_ports, &port));
+}
+
+static __always_inline int scope_for_net4(struct net4_key *key, struct scope_val *out)
+{
+    return scope_copy(out, bpf_map_lookup_elem(&scope_net4, key));
+}
+
+static __always_inline int scope_for_net6(struct net6_key *key, struct scope_val *out)
+{
+    return scope_copy(out, bpf_map_lookup_elem(&scope_net6, key));
 }
 
 static __always_inline int file_identity(struct file *file, __u64 *ino, __u32 *dev)
@@ -201,6 +251,9 @@ static __always_inline int allowed_current(void)
 /* Global policy, then the subject scope.
  *
  * narrow_mask blocks a class unless this subject has an allow bit.
+ * It is applied whether or not media_ok is set. media_ok == 1 does not
+ * open a class that narrow_mask still names. deny_mask is the
+ * missing-medium mask and is applied only when media_ok is 0.
  * scope deny blocks that subject even when the class is otherwise open.
  * scope allow clears only the bits it names, so a path grant cannot open
  * a different path or a different class.
@@ -219,6 +272,7 @@ static __always_inline int decide_subject(__u32 bit, int ret, int allowed,
     c = bpf_map_lookup_elem(&cfg_map, &z);
     if (!c || !c->enforcement)
         return 0;
+    /* Replace-rule narrow stays in force after every medium verifies. */
     blocked = c->narrow_mask & bit;
     if (!c->media_ok)
         blocked |= c->deny_mask & bit;
@@ -255,15 +309,15 @@ int BPF_PROG(ker_exec, struct linux_binprm *bprm, int ret)
         return r;
     cred = BPF_CORE_READ(bprm, cred);
     uid = BPF_CORE_READ(cred, euid.val);
-    have_uid = scope_for_uid(uid, &uid_sv);
-    if (have_uid && (uid_sv.deny_bits & (BIT_ROOTUSER | BIT_ROOTSU))) {
-        r = decide_subject(uid_sv.deny_bits, 0, allowed, &uid_sv, 1);
-        if (r)
-            return r;
-    }
-    if (uid == 0)
-        return decide_subject(BIT_ROOTUSER, 0, allowed, &uid_sv, have_uid);
-    return 0;
+    /* Login scope is the root-login bit, and only for euid 0.
+     * A grant for any other uid must not reach decide_subject: its
+     * allow_bits would clear BIT_ROOTUSER on that uid's ordinary exec.
+     * Non-root login rules are enforced by the SSH PAM helper.
+     */
+    if (uid != 0)
+        return 0;
+    have_uid = scope_for_uid(0, &uid_sv);
+    return decide_subject(BIT_ROOTUSER, 0, allowed, &uid_sv, have_uid);
 }
 
 SEC("lsm/file_permission")
@@ -303,18 +357,34 @@ int BPF_PROG(ker_setuid, struct cred *new, const struct cred *old, int flags, in
 {
     struct scope_val sv = {};
     __u32 uid = BPF_CORE_READ(new, euid.val);
-    int have = scope_for_uid(uid, &sv);
+    int have;
     int allowed = allowed_current();
+    int r;
 
-    if (have && (sv.deny_bits & (BIT_ROOTUSER | BIT_ROOTSU))) {
-        int r = decide_subject(sv.deny_bits, ret, allowed, &sv, 1);
-        if (r)
-            return r;
-    }
+    /* Becoming a non-root uid is not a root login and not setuid-to-root.
+     * Do not apply a login scope's allow or deny bits on that path.
+     */
     if (uid != 0)
         return ret;
-    return decide_subject(BIT_ROOTSU, ret, allowed, &sv, have);
+    have = scope_for_uid(0, &sv);
+    /* Privilege class, without the login scope, so a BIT_ROOTUSER grant
+     * cannot clear BIT_ROOTSU.
+     */
+    r = decide_subject(BIT_ROOTSU, ret, allowed, 0, 0);
+    if (r)
+        return r;
+    /* uid 0 login grant/lock is BIT_ROOTUSER. Honor it on this transition. */
+    if (have && ((sv.allow_bits | sv.deny_bits) & BIT_ROOTUSER))
+        return decide_subject(BIT_ROOTUSER, 0, allowed, &sv, 1);
+    return 0;
 }
+
+/* AF_UNIX (1) and AF_NETLINK (16) are not port-scoped grants. They are
+ * left without a scope on purpose: a TCP/UDP port allow does not cover
+ * them, and they are not rewritten into one.
+ */
+#define KER_AF_INET  2
+#define KER_AF_INET6 10
 
 SEC("lsm/socket_connect")
 int BPF_PROG(ker_connect, struct socket *sock, struct sockaddr *addr, int addrlen, int ret)
@@ -323,15 +393,40 @@ int BPF_PROG(ker_connect, struct socket *sock, struct sockaddr *addr, int addrle
     int have = 0;
     __u16 family = 0;
 
-    if (addr) {
+    if (addr && addrlen > 0) {
         family = BPF_CORE_READ(addr, sa_family);
-        /* sin_port and sin6_port share the same offset. Other families
-         * are not a port-scoped grant. */
-        if (family == 2 || family == 10) {
-            struct sockaddr_in *in4 = (struct sockaddr_in *)addr;
-            __u16 port = bpf_ntohs(BPF_CORE_READ(in4, sin_port));
-            __u32 key = port;
-            have = scope_for_port(key, &sv);
+        /* connect() is outbound. An exact address+port entry is preferred
+         * over a ports-only entry so a grant for one address is not an
+         * allow for every address on that port. A ports-only map entry
+         * still matches any destination, because that rule named no
+         * address. Inbound is not mediated here.
+         */
+        if (family == KER_AF_INET && addrlen >= (int)sizeof(struct sockaddr_in)) {
+            struct sockaddr_in in4 = {};
+            struct net4_key key = {};
+            __u32 port;
+
+            bpf_core_read(&in4, sizeof(in4), addr);
+            key.port = bpf_ntohs(in4.sin_port);
+            __builtin_memcpy(key.addr, &in4.sin_addr.s_addr, 4);
+            have = scope_for_net4(&key, &sv);
+            if (!have) {
+                port = key.port;
+                have = scope_for_port(port, &sv);
+            }
+        } else if (family == KER_AF_INET6 && addrlen >= (int)sizeof(struct sockaddr_in6)) {
+            struct sockaddr_in6 in6 = {};
+            struct net6_key key = {};
+            __u32 port;
+
+            bpf_core_read(&in6, sizeof(in6), addr);
+            key.port = bpf_ntohs(in6.sin6_port);
+            __builtin_memcpy(key.addr, in6.sin6_addr.in6_u.u6_addr8, 16);
+            have = scope_for_net6(&key, &sv);
+            if (!have) {
+                port = key.port;
+                have = scope_for_port(port, &sv);
+            }
         }
     }
     return decide_subject(BIT_NETWORK, ret, allowed_current(), &sv, have);
