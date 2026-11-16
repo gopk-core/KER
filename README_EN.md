@@ -13,6 +13,12 @@ Current version: **0.1** (first public release). License: [GNU Affero General Pu
 - Without Secure Boot or kernel lockdown, KER still cannot stop a root user from replacing the kernel or the bootloader. It provides signed-media authorization and optional LSM enforcement, not a firmware root of trust.
 - The `boot.pem` early-boot hook is fail-closed in enforcement mode: missing media or a failed verify refuses to continue to the real root filesystem. Do not weaken this policy.
 
+## Disclaimer
+
+KER is provided as is, and its source code is publicly available. The authors and contributors are not liable for any loss arising from use of this software, including but not limited to failure to boot or log in, system deadlock or lockout, inaccessible data, or service interruption.
+
+Once enforcement, the boot hook, or runtime interception is enabled, the machine may refuse to boot, refuse login, or immediately deny user commands (including those of root) if required media is missing, damaged, lost, or unreadable, if verification fails, or if hardware, configuration, or operator error occurs. You assume those risks. Assess them before use, and keep your own recovery plan.
+
 ## What KER is
 
 KER carries signed permission keys on external media (USB drives, removable disks, DVDs, WORM, and similar devices) and uses them at boot, login, and runtime to decide whether a machine is authorized for a given action.
