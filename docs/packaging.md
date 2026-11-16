@@ -53,7 +53,7 @@ the compiler and architecture names.
 
 `packaging/release.gpg` is a public OpenPGP key. `packaging/stage.sh` installs it to `/usr/lib/ker/release-keys/release.gpg`. The private key is not in git, and this repository does not contain a passphrase or a secret keyring.
 
-The public key currently in the tree (fingerprint `AB264D24E538B7DC0E449FC16EE0524231372B31`) was generated so the file format and the install path are real. Its private half was not retained. Before you publish signed packages, replace `packaging/release.gpg` with the public key that matches the offline private key you will actually sign with, and tell operators that fingerprint out of band. Until then, `gpgv` against the shipped key will not verify signatures from any other key.
+The public key in the tree has fingerprint `5CD9239471197D54D8BEC1877016C5463085F8B3`. The matching private key is kept offline, outside the repository. Tell operators this fingerprint out of band. Signatures made with any other key will not verify against the shipped key.
 
 Create the key on a machine you keep offline:
 
